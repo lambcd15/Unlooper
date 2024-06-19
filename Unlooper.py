@@ -142,6 +142,7 @@ if __name__ == "__main__":
     else:
         # collector speed [mm/min]
         file_name = sys.argv[1]
+        variables["unloop_only"] = sys.argv[2]
 
     # ************************************ Functions ******************************************
     # Functions for reading in gcode:

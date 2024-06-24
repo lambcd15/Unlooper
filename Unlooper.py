@@ -54,7 +54,6 @@ if __name__ == "__main__":
     import mmap
     import subprocess
     import pandas as pd
-    from Ievgenii.python_lag import *
 
     # ************************************   Variables    ******************************************
     variables = {
@@ -385,21 +384,21 @@ if __name__ == "__main__":
                 # Assign the read in variables to their correct parameters 
                 match variable_temp:
                     # Converts everything to µm
-                    case "SyringeTemperature":
+                    case "Syringe_Temperature":
                         variables["Syringe_Temperature"] = float(re.sub("[^\d\.]", "", newline[1]))
-                    case "NeedleTemperature":
+                    case "Needle_Temperature":
                         variables["Needle_Temperature"] = float(re.sub("[^\d\.]", "", newline[1]))
-                    case "BuildPlateTemperature":
+                    case "Build_Plate_Temperature":
                         variables["Build_Plate_Temperature"] = float(re.sub("[^\d\.]", "", newline[1]))
-                    case "AppliedVoltage":
+                    case "Applied_Voltage":
                         variables["Applied_Voltage"] = float(re.sub("[^\d\.]", "", newline[1]))
-                    case "AppliedPressure":
+                    case "Applied_Pressure":
                         variables["Applied_Pressure"] = float(re.sub("[^\d\.]", "", newline[1]))
-                    case "FibreDiameter":
+                    case "Fibre_Diameter":
                         variables["Fibre_Diameter"] = float(re.sub("[^\d\.]", "", newline[1]))
-                    case "MaterialDensity":
+                    case "Material_Density":
                         variables["Material_Density"] = float(re.sub("[^\d\.]", "", newline[1]))
-                    case "CriticalTranslationSpeed":
+                    case "Critical_TranslationSpeed":
                         variables["global_return_CTS"] = float(re.sub("[^\d\.]", "", newline[1]))
                     case "Speed_Ratio":
                         variables["Speed_Ratio"] = float(re.sub("[^\d\.]", "", newline[1]))

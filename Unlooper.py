@@ -133,25 +133,25 @@ if __name__ == "__main__":
     # Commands you can edit
     # Setting to 0 will unloop and generate an image
     # Setting to 1 will unloop only and not generate an image
-    variables["unloop_only"] = 1
+    variables["unloop_only"] = 0
     # gcode filename enter in your own filename below
-    lag_length = 0
     if len(sys.argv) < 2:
         # Everything must contain forward slashes only
-        file_name = "TXT Files/DO_4 x10.txt"
+        file_name = "TXT Files/INSERT_CODE_INTO_THIS_FILE.txt"
     else:
         # collector speed [mm/min]
         file_name = sys.argv[1]
         variables["unloop_only"] = sys.argv[2]
 
     # ************************************ Functions ******************************************
+    # Do not touch
     # Functions for reading in gcode:
     # Extract the filename from the input, permit this to work by backwards scanning to allow for different names
     # Remove the file extension
     split_path = os.path.splitext(file_name)[0]
 
     file_name_only = os.path.basename(split_path)  # This works for any path variation
-    # Do not touch
+    
     params = {
         "Filename": file_name,
         "Filename_only": file_name_only,

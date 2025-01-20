@@ -53,3 +53,8 @@ Make sure to download and run the requriements.txt file (navigate to the folder 
 ```
 pip install -r requirements.txt
 ```
+
+## Example image from output
+
+![Custom_complex_scaffold_SR1 0_Raw_image_output](https://github.com/user-attachments/assets/f256c392-e3ee-4ad2-af75-4a53d4f6fc08)
+

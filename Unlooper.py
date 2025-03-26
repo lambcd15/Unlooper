@@ -147,10 +147,11 @@ if __name__ == "__main__":
     # Functions for reading in gcode:
     # Extract the filename from the input, permit this to work by backwards scanning to allow for different names
     # Remove the file extension
+
     split_path = os.path.splitext(file_name)[0]
 
     file_name_only = os.path.basename(split_path)  # This works for any path variation
-    
+
     params = {
         "Filename": file_name,
         "Filename_only": file_name_only,
@@ -367,6 +368,16 @@ if __name__ == "__main__":
     def parameters_extraction(params, variables):
         # This will take in a parameter array and loop through extracting the parameters and ordering them then returning the array
         params["Parameters"] = [0] * len(variables["Variable_names"])
+        # Initialize all parameters
+        variables["Syringe_Temperature"]    = 0
+        variables["Needle_Temperature"]     = 0
+        variables["Build_Plate_Temperature"]= 0
+        variables["Applied_Voltage"]        = 0
+        variables["Applied_Pressure"]       = 0
+        variables["Fibre_Diameter"]         = 0
+        variables["Material_Density"]       = 0
+        variables["global_return_CTS"]      = 0
+        variables["Speed_Ratio"]            = 0
         # Loop through the lines within contents and match each variable with the correct name listed above
         for line in params["Parameters_line_array"]:
             # First section the line at the ':'
@@ -384,21 +395,21 @@ if __name__ == "__main__":
                 # Assign the read in variables to their correct parameters 
                 match variable_temp:
                     # Converts everything to µm
-                    case "Syringe_Temperature":
+                    case "SyringeTemperature":
                         variables["Syringe_Temperature"] = float(re.sub("[^\d\.]", "", newline[1]))
-                    case "Needle_Temperature":
+                    case "NeedleTemperature":
                         variables["Needle_Temperature"] = float(re.sub("[^\d\.]", "", newline[1]))
-                    case "Build_Plate_Temperature":
+                    case "BuildPlateTemperature":
                         variables["Build_Plate_Temperature"] = float(re.sub("[^\d\.]", "", newline[1]))
-                    case "Applied_Voltage":
+                    case "AppliedVoltage":
                         variables["Applied_Voltage"] = float(re.sub("[^\d\.]", "", newline[1]))
-                    case "Applied_Pressure":
+                    case "AppliedPressure":
                         variables["Applied_Pressure"] = float(re.sub("[^\d\.]", "", newline[1]))
-                    case "Fibre_Diameter":
+                    case "FibreDiameter":
                         variables["Fibre_Diameter"] = float(re.sub("[^\d\.]", "", newline[1]))
-                    case "Material_Density":
+                    case "MaterialDensity":
                         variables["Material_Density"] = float(re.sub("[^\d\.]", "", newline[1]))
-                    case "Critical_TranslationSpeed":
+                    case "CriticalTranslationSpeed":
                         variables["global_return_CTS"] = float(re.sub("[^\d\.]", "", newline[1]))
                     case "Speed_Ratio":
                         variables["Speed_Ratio"] = float(re.sub("[^\d\.]", "", newline[1]))
@@ -1690,23 +1701,28 @@ if __name__ == "__main__":
         print("Total Time:", day, "day", hour, "hr", minutes, "min", seconds, "s")
 
         # Volume in cm^3
-        volume = (((params["Parameters"][5] / 2) ** 2 * math.pi) * sum(params["Distance_array"])) * 0.001
-        material_mass = volume * params["Parameters"][6]
-        correction_factor = 1.25
-        variables["Material_Used"] = material_mass * correction_factor
-        print("Material Used: ",round(round(variables["Material_Used"], 4) * 1000, 10),"mg",)
+        if variables["Fibre_Diameter"] != 0 and variables["Material_Density"] != 0:
+            volume = (((variables["Fibre_Diameter"] * 0.001 / 2) ** 2 * math.pi) * sum(params["Distance_array"])) * 0.001 #mm3 the 0.001 is to convert to cm3
+            print("Volume Used: ",round(volume, 4),"ml",)
+            material_mass = volume * variables["Material_Density"]  # cm3 * g/cm3 to get grams
+            correction_factor = 1.25 #?
+            variables["Material_Used"] = round(material_mass * correction_factor, 5) * 1000 #
+        else:
+            variables["Material_Used"] = 0
+        print("Material Used: ",round(round(variables["Material_Used"], 4), 10),"mg",)
         # global global_return_CTS
         # global_return_CTS = params["Parameters"][7]
         # Get the out;uts ready to save to the ext file
         variables["Estimated_Time"] = (str(day)+ " day "+ str(hour)+ " hr "+ str(minutes)+ " min "+ str(seconds)+ " s")
         # materialout = (str(round(round((material_mass * correction_factor), 4) * 1000, 1)) + " mg")
+        # print(variables["min_x"],variables["max_x"],variables["min_y"],variables["max_y"])
 
-        variables["X_build"] = round((abs(min_x) + abs(max_x)) + 2)  # mm
-        if min_y < 0 and max_y < 0:
+        variables["X_build"] = round((abs(variables["min_x"]) + abs(variables["max_x"])) + 2)  # mm
+        if variables["min_y"] < 0 and variables["max_y"] < 0:
             # This is to solve issues with having a build plate that is longer than the print due to Two negative values
-            variables["Y_build"] = math.ceil(abs(min_y)) + 2  # mm
+            variables["Y_build"] = math.ceil(abs(variables["min_y"])) + 2  # mm
         else:
-            variables["Y_build"] = math.ceil(abs(min_y) + abs(max_y)) + 2  # mm
+            variables["Y_build"] = math.ceil(abs(variables["min_y"]) + abs(variables["max_y"])) + 2  # mm
         print("Total size used x:", (variables["X_build"] - 2), "y:", (variables["Y_build"] - 2))
         # Save the pixel coordinates to a file
         if variables["high_speed"] == False : 

@@ -8,6 +8,7 @@ subpixel_edges
 argparse
 Pillow
 pandas
+PySide6
 glob2
 seaborn
 statannot

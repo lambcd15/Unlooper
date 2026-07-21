@@ -123,6 +123,11 @@ if __name__ == "__main__":
         "Estimated_Time": 0.0,
         "Material_Used": 0.0, # grams
 
+        # User-supplied overrides (mm/min). If 0, fall back to the file's own feed rates /
+        # fibre diameter & material density for the time and material calculations.
+        "Feedrate_override_mm_min": 0,
+        "Flow_rate_override_mg_min": 0,
+
         # Lag compensation
         "compensation_image": [],
         "compensation_complete": False # This will change after the lag has been compensated
@@ -136,12 +141,18 @@ if __name__ == "__main__":
     # gcode filename enter in your own filename below
     if len(sys.argv) < 2:
         # Everything must contain forward slashes only
-        file_name = "TXT Files/INSERT_CODE_INTO_THIS_FILE.txt"
+        file_name = "motion_printlog_M3_S12_B1_14-01-26_1624_filtered.gcode"
     else:
         # collector speed [mm/min]
         file_name = sys.argv[1]
-        variables["unloop_only"] = sys.argv[2]
-
+        variables["unloop_only"] = int(sys.argv[2])
+        # Optional: feedrate override (mm/min, dictates the time estimate) and
+        # flow rate override (mg/min, dictates the material estimate). Omit or pass 0 to
+        # fall back to the file's own feed rates / fibre diameter & material density.
+        if len(sys.argv) >= 4:
+            variables["Feedrate_override_mm_min"] = float(sys.argv[3])
+        if len(sys.argv) >= 5:
+            variables["Flow_rate_override_mg_min"] = float(sys.argv[4])
     # ************************************ Functions ******************************************
     # Do not touch
     # Functions for reading in gcode:
@@ -175,9 +186,8 @@ if __name__ == "__main__":
         "Pixel_coords_um": [],
         "One_coordinate_system": [], # This is to contain all commands transposed to G90 (absolute)
         # The following commands are for reduction in drawing time
-        "commands_used": [],
+        "commands_used": {}, # Maps (X, Y, Line, Positioning) -> number of times plotted, for O(1) lookup
         "command_check": False, # This is true if the command has been used before
-        "commands_used_counter": [], # This array stores all the commands that have been plotted already
         "Current_X_array": [], # This array is a record of all the x commands 
         "Current_Y_array": [],
         "Distance_array": [], # array for all the distances that each command is
@@ -323,6 +333,10 @@ if __name__ == "__main__":
                     params["File_contents_edited"].append(newline[0])
             elif line.find("#") != -1:
                 # If line contains # skip it
+                pass
+            elif line.strip().upper().startswith("M117"):
+                # M117 status/display messages (e.g. "M117 [1][H][1/250][X+][S]") carry no
+                # motion data and their bracket text breaks segment_line's tokenizer, so drop them
                 pass
             else:
                 newline = line
@@ -964,12 +978,13 @@ if __name__ == "__main__":
         # Once the code has been completed the image can be then be used to iterate accross to form the array
         # This also returns the color increase every time a command is called so that the color changes the more times the print head passses over the same location
         color = (5, 0, 0)
-        if [variables["Current_X"], variables["Current_Y"], params["Line"], params["Positioning"]] in params["commands_used"]:
-            index = params["commands_used"].index([variables["Current_X"], variables["Current_Y"], params["Line"], params["Positioning"]])
-            params["commands_used_counter"][index] += 1
-            color = (5 * params["commands_used_counter"][index], 0, 0)
-            if 5 * params["commands_used_counter"][index] > 255:
-                color = (255, (5 * params["commands_used_counter"][index]) - 255, 0)
+        key = (variables["Current_X"], variables["Current_Y"], params["Line"], params["Positioning"])
+        if key in params["commands_used"]:
+            params["commands_used"][key] += 1
+            count = params["commands_used"][key]
+            color = (5 * count, 0, 0)
+            if 5 * count > 255:
+                color = (255, (5 * count) - 255, 0)
             # print(color)
             if variables["all_black"] == 0:
                 params["command_check"] = True
@@ -1009,8 +1024,7 @@ if __name__ == "__main__":
         if variables["calc_only"] == 0 and variables["Disable_colour_update"] == False:  # Ensure the function is in plotting mode
             params, variables = check_command(params, variables)
             if params["command_check"] == False:
-                params["commands_used"].append([variables["Current_X"], variables["Current_Y"], params["Line"], params["Positioning"]])
-                params["commands_used_counter"].append(1)
+                params["commands_used"][(variables["Current_X"], variables["Current_Y"], params["Line"], params["Positioning"])] = 1
         # Segment the line into seperate cells
         params, variables = segment_line(params, variables)
         if params["Positioning"] == "G90" or params["Positioning"] == "G90 ":
@@ -1074,8 +1088,7 @@ if __name__ == "__main__":
         if variables["calc_only"] == 0 and variables["Disable_colour_update"] == False:  # Ensure the function is in plotting mode
             params, variables = check_command(params, variables)
             if params["command_check"] == False:
-                params["commands_used"].append([variables["Current_X"], variables["Current_Y"], params["Line"], params["Positioning"]])
-                params["commands_used_counter"].append(1)
+                params["commands_used"][(variables["Current_X"], variables["Current_Y"], params["Line"], params["Positioning"])] = 1
         # Segment the line into seperate cells
         params, variables = segment_line(params, variables)
         # Update the end co-ordinates for the end of the curve ensure that the correct co-ordinate system is used
@@ -1217,8 +1230,7 @@ if __name__ == "__main__":
         if variables["calc_only"] == 0 and variables["Disable_colour_update"] == False:  # Ensure the function is in plotting mode
             params, variables = check_command(params, variables)
             if params["command_check"] == False:
-                params["commands_used"].append([variables["Current_X"], variables["Current_Y"], params["Line"], params["Positioning"]])
-                params["commands_used_counter"].append(1)
+                params["commands_used"][(variables["Current_X"], variables["Current_Y"], params["Line"], params["Positioning"])] = 1
         # Segment the line into seperate cells
         params, variables = segment_line(params, variables)
         # Update the end co-ordinates for the end of the curve ensure that the correct co-ordinate system is used
@@ -1688,9 +1700,15 @@ if __name__ == "__main__":
         # print("Correct: ",variables["Origin_X"],variables["Origin_Y"])
         # Entire Print calculations
         # Determine the linear distance travelled and use it to compute the approximate time
-        print("Distance travelled:", round(sum(params["Distance_array"]) / 1000, 3), "m")
+        total_distance_mm = sum(params["Distance_array"])
+        print("Distance travelled:", round(total_distance_mm / 1000, 3), "m")
         # Time array is in seconds
-        seconds = round(sum(params["Time_array"]))
+        if variables["Feedrate_override_mm_min"] > 0:
+            # User-supplied feedrate overrides whatever feed rates are written in the file
+            total_seconds = total_distance_mm / variables["Feedrate_override_mm_min"] * 60
+        else:
+            total_seconds = sum(params["Time_array"])
+        seconds = round(total_seconds)
         day = seconds // (24 * 3600)
         seconds = seconds % (24 * 3600)
         hour = seconds // 3600
@@ -1701,8 +1719,12 @@ if __name__ == "__main__":
         print("Total Time:", day, "day", hour, "hr", minutes, "min", seconds, "s")
 
         # Volume in cm^3
-        if variables["Fibre_Diameter"] != 0 and variables["Material_Density"] != 0:
-            volume = (((variables["Fibre_Diameter"] * 0.001 / 2) ** 2 * math.pi) * sum(params["Distance_array"])) * 0.001 #mm3 the 0.001 is to convert to cm3
+        if variables["Flow_rate_override_mg_min"] > 0:
+            # User-supplied flow rate overrides the fibre diameter / material density calculation
+            # Raw multiply, no unit conversion: mg = (mg/min) * min
+            variables["Material_Used"] = round(variables["Flow_rate_override_mg_min"] * (total_seconds / 60), 5)
+        elif variables["Fibre_Diameter"] != 0 and variables["Material_Density"] != 0:
+            volume = (((variables["Fibre_Diameter"] * 0.001 / 2) ** 2 * math.pi) * total_distance_mm) * 0.001 #mm3 the 0.001 is to convert to cm3
             print("Volume Used: ",round(volume, 4),"ml",)
             material_mass = volume * variables["Material_Density"]  # cm3 * g/cm3 to get grams
             correction_factor = 1.25 #?

@@ -14,8 +14,9 @@ import re
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, Slot
-from PySide6.QtGui import QPixmap
+import cv2
+from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, Slot, QSize
+from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QCheckBox, QFileDialog, QProgressBar, QPlainTextEdit,
@@ -112,18 +113,29 @@ class UnlooperWindow(QMainWindow):
         )
         overrides_grid.addWidget(self.feedrate_spin, 0, 1)
 
-        overrides_grid.addWidget(QLabel("Flow rate (mg/min):"), 1, 0)
-        self.flowrate_spin = QDoubleSpinBox()
-        self.flowrate_spin.setRange(0, 1_000_000)
-        self.flowrate_spin.setDecimals(3)
-        self.flowrate_spin.setSingleStep(0.1)
-        self.flowrate_spin.setToolTip(
+        overrides_grid.addWidget(QLabel("Fiber diameter (µm):"), 1, 0)
+        self.fibre_diameter_spin = QDoubleSpinBox()
+        self.fibre_diameter_spin.setRange(0, 1_000_000)
+        self.fibre_diameter_spin.setDecimals(3)
+        self.fibre_diameter_spin.setSingleStep(0.1)
+        self.fibre_diameter_spin.setToolTip(
+            "If > 0, dictates the fibre diameter directly:\n"
+            "Used for material calculations.\n"
+            "Leave at 0 to not calculate the material used."
+        )
+        overrides_grid.addWidget(self.fibre_diameter_spin, 1, 1)
+
+        overrides_grid.addWidget(QLabel("Density (g/mm³):"), 2, 0)
+        self.density_spin = QDoubleSpinBox()
+        self.density_spin.setRange(0, 1_000_000)
+        self.density_spin.setDecimals(3)
+        self.density_spin.setSingleStep(0.1)
+        self.density_spin.setToolTip(
             "If > 0, dictates material used directly:\n"
-            "material (mg) = flow rate x total time (minutes).\n"
-            "Raw multiply, no unit conversion applied.\n"
+            "material density (g/mm³).\n"
             "Leave at 0 to use the file's fibre diameter / material density."
         )
-        overrides_grid.addWidget(self.flowrate_spin, 1, 1)
+        overrides_grid.addWidget(self.density_spin, 2, 1)
         left_layout.addWidget(overrides_group)
 
         out_group = QGroupBox("Output Folder")
@@ -309,7 +321,9 @@ class UnlooperWindow(QMainWindow):
 
         unloop_only = "1" if self.unloop_only_check.isChecked() else "0"
         feedrate = str(self.feedrate_spin.value())
-        flowrate = str(self.flowrate_spin.value())
+        density = str(self.density_spin.value())
+        fibre_diameter = str(self.fibre_diameter_spin.value())
+        # flowrate = str(self.flowrate_spin.value())
 
         env = QProcessEnvironment.systemEnvironment()
         env.insert("PYTHONUNBUFFERED", "1")
@@ -320,7 +334,9 @@ class UnlooperWindow(QMainWindow):
         self.process.setWorkingDirectory(str(self.output_base_dir))
         self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self.process.setProgram(sys.executable)
-        self.process.setArguments([str(UNLOOPER_SCRIPT), self._active_file, unloop_only, feedrate, flowrate])
+        # Arguments are: Unlooper.py <file> <unloop_only> <feedrate> <density> <fibre_diameter>
+        # Restored to provide more user control over the material estimate, as per the recent edits in Unlooper.py
+        self.process.setArguments([str(UNLOOPER_SCRIPT), self._active_file, unloop_only, feedrate, density, fibre_diameter])
         self.process.readyReadStandardOutput.connect(self._on_output)
         self.process.finished.connect(self._on_finished)
         self.process.errorOccurred.connect(self._on_process_error)
@@ -399,14 +415,37 @@ class UnlooperWindow(QMainWindow):
     def _load_preview(self):
         image_path = self._output_dir() / f"{self._stem()}_cv2_Image_output.png"
         if image_path.exists():
-            pixmap = QPixmap(str(image_path))
-            if not pixmap.isNull():
-                self.preview_label.setPixmap(pixmap.scaled(
-                    self.preview_label.size(),
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                ))
-                return
+            preview_size = self.preview_label.size()
+            if preview_size.width() <= 0 or preview_size.height() <= 0:
+                preview_size = QSize(1400, 900)
+
+            image = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
+            if image is not None:
+                height, width = image.shape[:2]
+                max_width = max(1, min(preview_size.width(), 1600))
+                max_height = max(1, min(preview_size.height(), 1600))
+                scale = min(max_width / width, max_height / height, 1.0)
+                if scale < 1.0:
+                    target_width = max(1, int(width * scale))
+                    target_height = max(1, int(height * scale))
+                    image = cv2.resize(image, (target_width, target_height), interpolation=cv2.INTER_AREA)
+
+                if len(image.shape) == 2:
+                    qimage = QImage(image.data, image.shape[1], image.shape[0], image.strides[0], QImage.Format_Grayscale8)
+                else:
+                    rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                    qimage = QImage(rgb_image.data, rgb_image.shape[1], rgb_image.shape[0], rgb_image.strides[0], QImage.Format_RGB888)
+
+                if not qimage.isNull():
+                    pixmap = QPixmap.fromImage(qimage)
+                    self.preview_label.setPixmap(
+                        pixmap.scaled(
+                            self.preview_label.size(),
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation,
+                        )
+                    )
+                    return
         self.preview_label.setText("No image was generated for this run")
 
     def resizeEvent(self, event):

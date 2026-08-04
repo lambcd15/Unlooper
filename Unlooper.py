@@ -923,7 +923,11 @@ if __name__ == "__main__":
                         params["Pixel_coords_um"].append([params["X2"],params["Y2"]])
         return params, variables
 
-    def docircle(params, variables):
+    def docircle(params, variables, flag=0):
+        # Calcualte the length of the arc
+        if flag == 1:
+            # This is for the case where the arc is a full circle and the diff is 360 degrees
+            params["Diff"] = 360.0
         # Calcualte the length of the arc
         params["Distance"] = (math.pi * params["Radius"] * 2) * (params["Diff"] / 360.0)
         # Determine the number of segments
@@ -1162,16 +1166,18 @@ if __name__ == "__main__":
         #     params["Radius"] = temp
         #     params["Plotting_colour"] = temp_colour
         if q == 0:
+            # This is a full circle so the start and end pos are the same
             if variables["calc_only"] == 0:
                 if variables["scatter_path"] == 0:
                     draw_circle(params,variables)
                 else:
                     params["dir"] = 2
-                    params,variables = docircle(params,variables)
+                    params,variables = docircle(params,variables, flag=1)
             else:
+                # Calculate the distance of the circle and then call the docircle function to get the pixel coordinates
                 params["Distance"] = math.pi * params["Radius"] * 2
                 params["dir"] = 2
-                params, variables = docircle(params, variables)
+                params, variables = docircle(params, variables, flag=1)
         else:
             # Determine the start and end angle of the arc
             if params["Line"].find("J", 0, len(params["Line"])) != -1 or params["Line"].find("I", 0, len(params["Line"])) != -1:
@@ -1298,16 +1304,18 @@ if __name__ == "__main__":
         #     params["Radius"] = temp
         #     params["Plotting_colour"] = temp_colour
         if q == 0:
+            # This is a full circle so the start and end pos are the same
             if variables["calc_only"] == 0:
                 if variables["scatter_path"] == 0:
                     draw_circle(params,variables)
                 else:
                     params["dir"] = 3
-                    params,variables = docircle(params,variables)       
+                    params,variables = docircle(params,variables, flag=1)       
             else:
+                # Calculate the distance of the circle and then call the docircle function to get the pixel coordinates
                 params["Distance"] = math.pi * params["Radius"] * 2
                 params["dir"] = 3
-                params, variables = docircle(params, variables)
+                params, variables = docircle(params, variables, flag=1)
         else:
             # Determine the start and end angle of the arc
             if params["Line"].find("J", 0, len(params["Line"])) != -1 or params["Line"].find("I", 0, len(params["Line"])) != -1:

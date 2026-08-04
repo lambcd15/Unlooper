@@ -153,7 +153,9 @@ if __name__ == "__main__":
         if len(sys.argv) >= 4:
             variables["Feedrate_override_mm_min"] = float(sys.argv[3])
         if len(sys.argv) >= 5:
-            variables["Flow_rate_override_mg_min"] = float(sys.argv[4])
+            variables["Material_Density_override"] = float(sys.argv[4])
+        if len(sys.argv) >= 6:
+            variables["Fibre_Diameter_override"] = float(sys.argv[5])
     # ************************************ Functions ******************************************
     # Do not touch
     # Functions for reading in gcode:
@@ -1718,17 +1720,19 @@ if __name__ == "__main__":
         seconds %= 60
         # Display the time to console
         print("Total Time:", day, "day", hour, "hr", minutes, "min", seconds, "s")
-
+        # Correction factor for the material due to differences in weight of the fibre and the actual volume of material used in the print. 
+        correction_factor = 1.0 #? 1.25
         # Volume in cm^3
-        if variables["Flow_rate_override_mg_min"] > 0:
-            # User-supplied flow rate overrides the fibre diameter / material density calculation
-            # Raw multiply, no unit conversion: mg = (mg/min) * min
-            variables["Material_Used"] = round(variables["Flow_rate_override_mg_min"] * (total_seconds / 60), 5)
+        if variables["Fibre_Diameter_override"] != 0 and variables["Material_Density_override"] != 0:
+            # User-supplied fibre diameter and material density overrides whatever values are written in the file
+            volume = (((variables["Fibre_Diameter_override"] * 0.001 / 2) ** 2 * math.pi) * total_distance_mm) * 0.001 #mm3 the 0.001 is to convert to cm3
+            print("Volume Used: ",round(volume, 4),"ml",)
+            material_mass = volume * variables["Material_Density_override"]  # cm3 * g/cm3 to get grams
+            variables["Material_Used"] = round(material_mass * correction_factor, 5) * 1000 #
         elif variables["Fibre_Diameter"] != 0 and variables["Material_Density"] != 0:
             volume = (((variables["Fibre_Diameter"] * 0.001 / 2) ** 2 * math.pi) * total_distance_mm) * 0.001 #mm3 the 0.001 is to convert to cm3
             print("Volume Used: ",round(volume, 4),"ml",)
             material_mass = volume * variables["Material_Density"]  # cm3 * g/cm3 to get grams
-            correction_factor = 1.25 #?
             variables["Material_Used"] = round(material_mass * correction_factor, 5) * 1000 #
         else:
             variables["Material_Used"] = 0

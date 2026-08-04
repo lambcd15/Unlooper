@@ -126,7 +126,8 @@ if __name__ == "__main__":
         # User-supplied overrides (mm/min). If 0, fall back to the file's own feed rates /
         # fibre diameter & material density for the time and material calculations.
         "Feedrate_override_mm_min": 0,
-        "Flow_rate_override_mg_min": 0,
+        "Fibre_Diameter_override": 0,
+        "Material_Density_override": 0,
 
         # Lag compensation
         "compensation_image": [],

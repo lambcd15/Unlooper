@@ -47,7 +47,7 @@ if __name__ == "__main__":
     from concurrent.futures import as_completed
     from sys import getsizeof
     # import glob
-    from moviepy.editor import VideoFileClip, concatenate_videoclips
+    # from moviepy.editor import VideoFileClip, concatenate_videoclips
     from natsort import natsorted
     # from PIL import Image, ImageOps
     from tqdm import tqdm

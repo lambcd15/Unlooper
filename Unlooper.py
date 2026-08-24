@@ -680,8 +680,9 @@ if __name__ == "__main__":
         M98_first = [i[0] for i in M98_variable]
         O_second = [i[1] for i in params["O_Array"]]
         while True:
-            # If current line does contain M2 stop
-            if current_line.find("M2") != -1:
+            # If current line does contain M2 stop, line must contain all of M2 and not a similar line M204
+            if current_line.find("M2") == 0 and len(current_line) == 2:
+                
                 # End of program
                 break
 
@@ -876,13 +877,11 @@ if __name__ == "__main__":
         # Input is in µm which is then converted to mm then to 10's of µm
         # Determine the angle of the line
         params["Angle"] = math.atan2(params["Y2"] - variables["Current_Y"], params["X2"] - variables["Current_X"])
-        # print(x1,x3,y1,y3)
         # Extract the values ***********************************************
         # previous_values stores the last commands distance left and feedrate
         # Next determine the distance into the current command from the segment_length and the distance_from_previous
         # First determine the segment length
         segment_length = (round(variables["scatter_resolution"] * params["Feed_rate"], 10) * 1000)  # To get segment length (speed mm/s * time s) tehn convert to microns
-        # print(segment_length, " µm") # µm
         # Then determine the distance from the start of command
         start_distance = 0
         if params["Feed_rate_previous"] != 0:
@@ -1068,7 +1067,6 @@ if __name__ == "__main__":
 
         params["Centre_1"].append(variables["Current_X"])
         params["Centre_1"].append(variables["Current_Y"])
-        # print(params["Centre_1"],params["Centre_2"])
         # If the line only contains Feed rate command (required for Marlin return)
         if "F" in params["Command_array"] and len(params["Command_array"]) == 4:
             return params, variables 
@@ -1414,6 +1412,12 @@ if __name__ == "__main__":
                     params["I_increase"] = round(float(params["Command_array"][i+1]) * variables["scale"],2)
                 case "J":
                     params["J_increase"] = round(float(params["Command_array"][i+1]) * variables["scale"],2)
+                # case "Z":
+                #     print("Z increase found, this is not supported in 2D plotting")
+                # case "E":
+                #     print("E increase found, this is not supported in 2D plotting")
+                # case "S":
+                #     print("S increase found, this is not supported in 2D plotting")
                 case "F":
                     # Feed rate will now only be found attached to another command, G1, G2, G3
                     params["Feed_rate"] = round(float(params["Command_array"][i+1]),2)
@@ -1457,13 +1461,21 @@ if __name__ == "__main__":
         temp_length_pixel_coords = len(params["Pixel_coords_um"]) 
         if params["Command_flag"] == "G":
             if params["Command_number"] == 92:
-            # This command will change the values for the origin_x and origin_y
-                variables["Origin_X_G92"] =  variables["Origin_X"]
-                variables["Origin_Y_G92"] =  variables["Origin_Y"]
-                # This will only track the last G92 command not the first which is used for later plotting
-                # Addition of new variable for original origin (the first one)
-                variables["Origin_X"] = variables["Current_X"] - params["X_increase"]
-                variables["Origin_Y"] = variables["Current_Y"] + params["Y_increase"]
+            # Altered to allow individual G92 commands to be used for each axis, this will allow for the use of G92.1 to reset the origin to the original machine coordinates
+                if params["Line"].find("X", 0, len(params["Line"])) != -1:
+                    variables["Origin_X_G92"] =  variables["Origin_X"]
+                    variables["Origin_X"] = variables["Current_X"] - params["X_increase"]
+                if params["Line"].find("Y", 0, len(params["Line"])) != -1:
+                    variables["Origin_Y_G92"] =  variables["Origin_Y"]
+                    variables["Origin_Y"] = variables["Current_Y"] + params["Y_increase"]
+            
+            # # This command will change the values for the origin_x and origin_y
+                
+                
+            #     # This will only track the last G92 command not the first which is used for later plotting
+            #     # Addition of new variable for original origin (the first one)
+            #     variables["Origin_X"] = variables["Current_X"] - params["X_increase"]
+            #     variables["Origin_Y"] = variables["Current_Y"] + params["Y_increase"]
                 
             if params["Command_number"] == 92.1:
             # Reset the G92 command to original machine global coordinates
@@ -1480,6 +1492,9 @@ if __name__ == "__main__":
             if params["Command_number"] == 1 or params["Command_number"] == 0:
                 # Found a G0 or G1 command
                 # New command structure, just pass it the command array instead
+                # If line only contains a feedrate command then just update the feedrate and return
+                # if "F" in params["Command_array"] and len(params["Command_array"]) == 4:
+                #     return params, variables
                 params, variables = Plotting_G1_2D(params, variables)  # Has to be a plus 3 to compensate for the index being at the start of the "G1 "
                 if variables["calc_only"] == 1:
                     # Update the overall array's

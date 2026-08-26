@@ -14,6 +14,8 @@ from msvcrt import getch
 # Commands for running in command prompt
 # python Gcode_processing.py "filename"
 
+# next functions - add acceleration and jerk to the code, this will allow for more accurate time calculations and material usage calculations
+
 # *******************************************************************************************************************************************
 # Multi-processing function calls
 # Structure for point in cartesian plane.
@@ -204,6 +206,8 @@ if __name__ == "__main__":
         "X_increase": float('NaN'),
         "Y_increase": float('NaN'),
         "Z_increase": float('NaN'),
+        "E_increase": float('NaN'),
+        "S_value": float('NaN'), # This is normally used during set temperature commands
         "Radius": float('NaN'),
         "I_increase": float('NaN'),
         "J_increase": float('NaN'),
@@ -1412,12 +1416,12 @@ if __name__ == "__main__":
                     params["I_increase"] = round(float(params["Command_array"][i+1]) * variables["scale"],2)
                 case "J":
                     params["J_increase"] = round(float(params["Command_array"][i+1]) * variables["scale"],2)
-                # case "Z":
-                #     print("Z increase found, this is not supported in 2D plotting")
-                # case "E":
-                #     print("E increase found, this is not supported in 2D plotting")
-                # case "S":
-                #     print("S increase found, this is not supported in 2D plotting")
+                case "Z":
+                    params["Z_increase"] = round(float(params["Command_array"][i+1]) * variables["scale"],2)
+                case "E":
+                    params["E_increase"] = round(float(params["Command_array"][i+1]) * variables["scale"],2)
+                case "S":
+                    params["S_value"] = round(float(params["Command_array"][i+1]) * variables["scale"],2)
                 case "F":
                     # Feed rate will now only be found attached to another command, G1, G2, G3
                     params["Feed_rate"] = round(float(params["Command_array"][i+1]),2)

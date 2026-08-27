@@ -1741,7 +1741,8 @@ if __name__ == "__main__":
         # print(params["Filament_array"])
         total_filament_used_mm = np.nansum(params["Filament_array"])
         print("Distance travelled:", round(total_distance_mm / 1000, 3), "m")
-        print("Filament used:", round(total_filament_used_mm, 3), "mm")
+        if variables["Feedrate_override_mm_min"] > 0:
+            print("Filament used:", round(total_filament_used_mm, 3), "mm")
         # Time array is in seconds
         if variables["Feedrate_override_mm_min"] > 0:
             # User-supplied feedrate overrides whatever feed rates are written in the file
@@ -1773,7 +1774,8 @@ if __name__ == "__main__":
             variables["Material_Used"] = round(material_mass * correction_factor, 5) * 1000 #
         else:
             variables["Material_Used"] = 0
-        print("Material Used: ",round(round(variables["Material_Used"], 4), 10),"mg",)
+        if variables["Material_Used"] > 0:
+            print("Material Used: ",round(round(variables["Material_Used"], 4), 10),"mg",)
         # global global_return_CTS
         # global_return_CTS = params["Parameters"][7]
         # Get the out;uts ready to save to the ext file

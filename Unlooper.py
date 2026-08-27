@@ -195,7 +195,8 @@ if __name__ == "__main__":
         "command_check": False, # This is true if the command has been used before
         "Current_X_array": [], # This array is a record of all the x commands 
         "Current_Y_array": [],
-        "Distance_array": [], # array for all the distances that each command is
+        "Distance_array": [], # array for all the distances
+        "Filament_array": [], # array for all the filament used
         "Distance": 0.0, # This is the previous feedrate from the last command
         "Distance_from_previous": 0.0, # This is the distance after the previous command
         "Time_array": [], # for cupouting the time taken for each move
@@ -1446,6 +1447,8 @@ if __name__ == "__main__":
         params["X_increase"] = float('NaN')
         params["Y_increase"] = float('NaN')
         params["Z_increase"] = float('NaN')
+        params["E_increase"] = float('NaN')
+        params["S_value"] = float('NaN')
         params["I_increase"] = 0
         params["J_increase"] = 0
         params["Radius"] = 0
@@ -1512,7 +1515,8 @@ if __name__ == "__main__":
                         params["Pixel_coords_um"][temp_length_pixel_coords][2] = temp_One_coordinate_system
                         # Used in lag vector to set the length of the computation without having to calculate it
                         params["Pixel_coords_um"][temp_length_pixel_coords][3] = (len(params["Pixel_coords_um"]) - temp_length_pixel_coords)
-                    params["Distance_array"].append((params["Distance"] / variables["scale"]))  # mm * scale
+                    params["Distance_array"].append((params["Distance"] / variables["scale"]))  # mm / scale
+                    params["Filament_array"].append(round((params["E_increase"] / variables["scale"]),5))  # mm / scale
                     # Compute the current time to complete the command using the feedrate
                     if params["Feed_rate"] > 0:
                         params["Time_array"].append((params["Distance"] / variables["scale"]) / params["Feed_rate"])  # mm / (mm/s)
@@ -1532,7 +1536,8 @@ if __name__ == "__main__":
                         params["Pixel_coords_um"][temp_length_pixel_coords][2] = temp_One_coordinate_system
                         # Used in lag vector to set the length of the computation without having to calculate it
                         params["Pixel_coords_um"][temp_length_pixel_coords][3] = (len(params["Pixel_coords_um"]) - temp_length_pixel_coords)
-                    params["Distance_array"].append((params["Distance"] / variables["scale"]))  # mm * scale
+                    params["Distance_array"].append((params["Distance"] / variables["scale"]))  # mm / scale
+                    params["Filament_array"].append((params["E_increase"] / variables["scale"]))  # mm / scale
                     # Compute the current time to complete the command using the feedrate
                     if params["Feed_rate"] > 0:
                         params["Time_array"].append((params["Distance"] / variables["scale"]) / params["Feed_rate"])  # mm / (mm/s)
@@ -1553,6 +1558,7 @@ if __name__ == "__main__":
                         # Used in lag vector to set the length of the computation without having to calculate it
                         params["Pixel_coords_um"][temp_length_pixel_coords][3] = (len(params["Pixel_coords_um"]) - temp_length_pixel_coords)
                     params["Distance_array"].append((params["Distance"] / variables["scale"]))  # mm * scale
+                    params["Filament_array"].append((params["E_increase"] / variables["scale"]))  # mm * scale
                     # Compute the current time to complete the command using the feedrate
                     if params["Feed_rate"] > 0:
                         params["Time_array"].append((params["Distance"] / variables["scale"]) / params["Feed_rate"])  # mm / (mm/s)
@@ -1658,6 +1664,7 @@ if __name__ == "__main__":
         params["Current_X_array"] = []
         params["Current_Y_array"] = []
         params["Distance_array"] = []
+        params["Filament_array"] = []
         params["Time_array"] = []
         # Feed rate will be used to calculate the total time of the code
         params["Feed_rate"] = 1
@@ -1731,7 +1738,10 @@ if __name__ == "__main__":
         # Entire Print calculations
         # Determine the linear distance travelled and use it to compute the approximate time
         total_distance_mm = sum(params["Distance_array"])
+        # print(params["Filament_array"])
+        total_filament_used_mm = np.nansum(params["Filament_array"])
         print("Distance travelled:", round(total_distance_mm / 1000, 3), "m")
+        print("Filament used:", round(total_filament_used_mm, 3), "mm")
         # Time array is in seconds
         if variables["Feedrate_override_mm_min"] > 0:
             # User-supplied feedrate overrides whatever feed rates are written in the file

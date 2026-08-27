@@ -1433,8 +1433,6 @@ if __name__ == "__main__":
                 case "M":
                     params["Command_number"] = float(params["Command_array"][i+1])
                     params["Command_flag"] = "M"
-
-        # print(params["X_increase"],params["Y_increase"],params["I_increase"],params["J_increase"])
         return params, variables
 
     def line_reader(params, variables):
@@ -1475,15 +1473,7 @@ if __name__ == "__main__":
                 if params["Line"].find("Y", 0, len(params["Line"])) != -1:
                     variables["Origin_Y_G92"] =  variables["Origin_Y"]
                     variables["Origin_Y"] = variables["Current_Y"] + params["Y_increase"]
-            
-            # # This command will change the values for the origin_x and origin_y
-                
-                
-            #     # This will only track the last G92 command not the first which is used for later plotting
-            #     # Addition of new variable for original origin (the first one)
-            #     variables["Origin_X"] = variables["Current_X"] - params["X_increase"]
-            #     variables["Origin_Y"] = variables["Current_Y"] + params["Y_increase"]
-                
+                            
             if params["Command_number"] == 92.1:
             # Reset the G92 command to original machine global coordinates
                 variables["Origin_X"] = variables["Origin_X_G92"]
@@ -1562,7 +1552,7 @@ if __name__ == "__main__":
                     # Compute the current time to complete the command using the feedrate
                     if params["Feed_rate"] > 0:
                         params["Time_array"].append((params["Distance"] / variables["scale"]) / params["Feed_rate"])  # mm / (mm/s)
-            # print(params["Line"],params["X1"],params["Y1"],params["X2"],params["Y2"],params["Diff"])
+        # Update the previous feedrate to be used in the next command
         params["Feed_rate_previous"] = params["Feed_rate"]
         return params, variables
 
@@ -1669,12 +1659,7 @@ if __name__ == "__main__":
         # Feed rate will be used to calculate the total time of the code
         params["Feed_rate"] = 1
         # Which positioning system is being used?
-        params["Positioning"] = []
-        # Build plate size:
-        # buildplate = [100 * 100,100 * 100,3,]  # 10um, 10um, RGB i.e. 5000 x 5000 is 50mm x 50mm
-        # Create the image that will show the gcode, the size of the image will be the bed size of the printer at 1um
-        # img = np.zeros(buildplate, dtype="uint8")  # Maximum of 150000, 150000, 3
-        # img[:] = variables["Background_colour"]  # Make the image have a black background
+        params["Positioning"] = []        
         # Determine the parameters used within the parameter table
         params, variables = parameters_extraction(params, variables)
         params["G2_G3_Edited_output"] = []
@@ -1683,15 +1668,11 @@ if __name__ == "__main__":
         for line in params["Unlooped_contents"]:
             # Loop through all the lines in the edited contents array
             params["Line"] = line
-            # print(line)
-            # print(params["Unlooped_contents"][0])
             params, variables = line_reader(params, variables)
-            # params["Unlooped_contents"][line_num] = params["Line"]
             if params["Edited_line"] != "":
                 params["G2_G3_Edited_output"].append(params["Edited_line"])
             else:
                 params["G2_G3_Edited_output"].append(line)
-            # line_num = line_num + 1
             
         # New feature for adapting any bad G2 and G3 commands is to alter the lines and then save the files
         if variables["edited_flag"]:
@@ -1702,16 +1683,6 @@ if __name__ == "__main__":
             params["Edit_Output"].close()
         # Determine the direction of the print and then the size to ensure that it remains in frame
         
-        # Changed to pixel_cords as of 24/10/2022
-        # if variables["high_speed"] == False : 
-        #     x_pixel_cords = [item[0] for item in params["Pixel_coords"]]  # Pixel_cords save the reolution for images i.e. at 10um
-        #     y_pixel_cords = [item[1] for item in params["Pixel_coords"]]
-        #     min_x = min(x_pixel_cords) / 100
-        #     max_x = max(x_pixel_cords) / 100
-
-        #     min_y = min(y_pixel_cords) / 100
-        #     max_y = max(y_pixel_cords) / 100
-        # else:
         min_x = min(params["Current_X_array"])
         max_x = max(params["Current_X_array"])
         variables["min_x"] = min_x
@@ -1734,7 +1705,6 @@ if __name__ == "__main__":
             variables["First_Origin_X"] = variables["Current_X"] * variables["scale"]
             variables["First_Origin_Y"] = variables["Current_Y"] * variables["scale"]
             variables["First_run"] = True
-        # print("Correct: ",variables["Origin_X"],variables["Origin_Y"])
         # Entire Print calculations
         # Determine the linear distance travelled and use it to compute the approximate time
         total_distance_mm = sum(params["Distance_array"])
@@ -1776,12 +1746,8 @@ if __name__ == "__main__":
             variables["Material_Used"] = 0
         if variables["Material_Used"] > 0:
             print("Material Used: ",round(round(variables["Material_Used"], 4), 10),"mg",)
-        # global global_return_CTS
-        # global_return_CTS = params["Parameters"][7]
         # Get the out;uts ready to save to the ext file
         variables["Estimated_Time"] = (str(day)+ " day "+ str(hour)+ " hr "+ str(minutes)+ " min "+ str(seconds)+ " s")
-        # materialout = (str(round(round((material_mass * correction_factor), 4) * 1000, 1)) + " mg")
-        # print(variables["min_x"],variables["max_x"],variables["min_y"],variables["max_y"])
 
         variables["X_build"] = round((abs(variables["min_x"]) + abs(variables["max_x"])) + 2)  # mm
         if variables["min_y"] < 0 and variables["max_y"] < 0:
@@ -1858,8 +1824,6 @@ if __name__ == "__main__":
         previous = time.time()
         # Print the time taken to complete the entire code
         print("It took",round(time.time() - variables["Start_time"], 5),"seconds to complete the program.",)
-        # print(commands_used_counter)
-        # print(commands_used)
  
         # Close the console log file
         sys.stdout.close()

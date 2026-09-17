@@ -719,7 +719,9 @@ if __name__ == "__main__":
             #                 pointer = params["O_Array"][m][0]  # + 1#Set the pointer to the array index of the loop + 1 as I want to skip the loop command 'o'
             #                 # subprogram = params["O_Array"][m-1][1]
             #                 break
-
+            # There is an issue when the M98 command is called from within a subprogram, this will cause an infinite loop as the M98 command will call the subprogram and then the M99 command will return to the subprogram and then the M98 command will be called again. This is not supported by this program and will be flagged as an error
+            # Especially if the M2 is behind a subprogram as the M2 will not be reached and the program will run infinitely
+            # Basically it does not set the loop number to zero when the M99 command is reached and the program will run infinitely
             if current_line.find("M99") != -1:
                 # Need to go to start of loop again and decrement params["M98_Array"]_variable
                 # Only need to find the closest o command above it

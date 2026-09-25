@@ -9,19 +9,23 @@ import that script — it launches it as a child process and parses its
 console output.
 """
 
+import math
 import os
 import re
 import sys
 from pathlib import Path
 
 import cv2
-from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, Slot, QSize
-from PySide6.QtGui import QImage, QPixmap
+import numpy as np
+from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, Slot, QSize, QRectF, QLineF
+from PySide6.QtGui import QImage, QPixmap, QPainter, QPainterPath, QPen, QColor, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QCheckBox, QFileDialog, QProgressBar, QPlainTextEdit,
-    QGroupBox, QSplitter, QDoubleSpinBox, QListWidget,
+    QGroupBox, QSplitter, QDoubleSpinBox, QListWidget, QGraphicsView,
+    QGraphicsScene, QComboBox, QGraphicsPathItem,
 )
+from PySide6.QtSvgWidgets import QGraphicsSvgItem
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 UNLOOPER_SCRIPT = SCRIPT_DIR / "Unlooper.py"
@@ -31,6 +35,98 @@ DISTANCE_RE = re.compile(r"Distance travelled:\s*([\d.]+)\s*m")
 TIME_RE = re.compile(r"Total Time:\s*(.+)")
 MATERIAL_RE = re.compile(r"Material Used:\s*([\d.]+)\s*mg")
 SIZE_RE = re.compile(r"Total size used x:\s*([\-\d.]+)\s*y:\s*([\-\d.]+)")
+
+# Number of toolpath segments per scene item. Big enough to keep the item count low on
+# large files, small enough that rebuilding the chunk under the cursor is instant.
+PREVIEW_CHUNK = 2000
+
+
+def build_toolpath_paths(segments):
+    # Build one QPainterPath per move type (1 = G0/G1, 2 = G2, 3 = G3) from rows of
+    # (kind, x1, y1, x2, y2, cx, cy, sweep_deg, line) as written by Unlooper.py
+    paths = {}
+    last_end = {}
+    for kind, x1, y1, x2, y2, cx, cy, sweep, _line in segments.tolist():
+        kind = int(kind)
+        path = paths.get(kind)
+        if path is None:
+            path = paths[kind] = QPainterPath()
+        if last_end.get(kind) != (x1, y1):
+            path.moveTo(x1, y1)
+        if kind == 1:
+            path.lineTo(x2, y2)
+        else:
+            r = math.hypot(x1 - cx, y1 - cy)
+            start_angle = math.degrees(math.atan2(cy - y1, x1 - cx))
+            path.arcTo(cx - r, cy - r, 2 * r, 2 * r, start_angle, sweep)
+        last_end[kind] = (x2, y2)
+    return paths
+
+
+def is_code_line(line):
+    # Mirrors how Unlooper.py filters lines (remove_comments / is_macro_line), so that an
+    # editor line can be matched to the line index the toolpath segments were recorded
+    # against. Comment-only lines (the ; header block, % parameters, #, M117) and blank
+    # lines are not counted; square-bracket macro lines are, as Unlooper.py keeps them.
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if stripped.startswith("[") or ("[" in stripped and "]" in stripped):
+        return True
+    if "%" in stripped or ";" in stripped:
+        return stripped.split("%", 1)[0].split(";", 1)[0].strip() != ""
+    if "#" in stripped or stripped.upper().startswith("M117"):
+        return False
+    return True
+
+
+class ToolpathView(QGraphicsView):
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        # Build-plate grid, set when a vector preview is loaded (None = plain background)
+        self.grid_rect = None
+        self.grid_spacing = 1000.0
+        self.grid_pen = QPen(QColor(220, 220, 220), 0)
+        self.plate_brush = QColor("white")
+        self.outside_brush = QColor(90, 90, 90)
+
+    def drawBackground(self, painter, rect):
+        if self.grid_rect is None:
+            super().drawBackground(painter, rect)
+            return
+        # Same look as the PNG: white build plate with light grey lines every 1 mm,
+        # and a darker surround outside the plate
+        painter.fillRect(rect, self.outside_brush)
+        plate = self.grid_rect
+        painter.fillRect(plate, self.plate_brush)
+        area = rect.intersected(plate)
+        if area.isEmpty():
+            return
+        # Thin the grid out when lines would be packed closer than 4 px
+        spacing = self.grid_spacing
+        while spacing * self.transform().m11() < 4:
+            spacing *= 10
+        # No antialiasing so each line lands on a single pixel row/column like the PNG's
+        # grid, rather than being smeared faintly across two
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.setPen(self.grid_pen)
+        x = math.ceil(area.left() / spacing) * spacing
+        while x <= area.right():
+            painter.drawLine(QLineF(x, area.top(), x, area.bottom()))
+            x += spacing
+        y = math.ceil(area.top() / spacing) * spacing
+        while y <= area.bottom():
+            painter.drawLine(QLineF(area.left(), y, area.right(), y))
+            y += spacing
+        painter.restore()
+
+    def wheelEvent(self, event):
+        factor = 1.2 if event.angleDelta().y() > 0 else 1 / 1.2
+        self.scale(factor, factor)
+        event.accept()
 
 
 class UnlooperWindow(QMainWindow):
@@ -48,6 +144,9 @@ class UnlooperWindow(QMainWindow):
         self.process = None
         self._out_buffer = ""
         self._run_completed = False
+        self._run_render_mode = "preview"
+        self._pending_place = None  # Editor/view position to return to after a replot
+        self._clear_preview_state()
 
         self._build_ui()
         self._update_run_enabled()
@@ -96,6 +195,24 @@ class UnlooperWindow(QMainWindow):
             "Off = full run (unloop + analyze + render image)."
         )
         opts_layout.addWidget(self.unloop_only_check)
+        self.motion_only_check = QCheckBox("Motion calcs only (no plotting)")
+        self.motion_only_check.setToolTip(
+            "Calculates distance, time, material and size but skips all plotting.\n"
+            "Sends render mode 'none' to Unlooper.py."
+        )
+        opts_layout.addWidget(self.motion_only_check)
+        render_row = QHBoxLayout()
+        render_row.addWidget(QLabel("Render type:"))
+        self.render_mode_combo = QComboBox()
+        self.render_mode_combo.addItem("Vector preview (SVG)", "preview")
+        self.render_mode_combo.addItem("Raster image (PNG)", "precise")
+        self.render_mode_combo.addItem("Both SVG and PNG", "both")
+        self.render_mode_combo.setToolTip("Choose which render output is generated on the next run.")
+        render_row.addWidget(self.render_mode_combo, stretch=1)
+        opts_layout.addLayout(render_row)
+        # Motion-only overrides the render type, and unloop-only skips the motion calcs entirely
+        self.motion_only_check.toggled.connect(self._update_option_states)
+        self.unloop_only_check.toggled.connect(self._update_option_states)
         left_layout.addWidget(opts_group)
 
         overrides_group = QGroupBox("Overrides (leave at 0 to use the file's own values)")
@@ -190,25 +307,73 @@ class UnlooperWindow(QMainWindow):
 
         left_layout.addStretch()
 
-        # Right: image preview + console log
+        # Right: editable code + vector preview + console log
         right_splitter = QSplitter(Qt.Orientation.Vertical)
 
-        self.preview_label = QLabel("No image yet — run without “Unloop only” to render one")
-        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setStyleSheet("background:#1e1e1e; color:#888;")
-        self.preview_label.setMinimumHeight(300)
-        right_splitter.addWidget(self.preview_label)
+        preview_group = QGroupBox("NCViewer Preview")
+        preview_layout = QVBoxLayout(preview_group)
+        self.preview_view = ToolpathView()
+        self.preview_view.setScene(QGraphicsScene(self.preview_view))
+        self.preview_view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.preview_view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.preview_view.setBackgroundBrush(Qt.GlobalColor.black)
+        self.preview_view.setMinimumHeight(260)
+        preview_layout.addWidget(self.preview_view)
+        preview_row = QHBoxLayout()
+        self.hide_after_cursor_check = QCheckBox("Hide toolpath after cursor")
+        self.hide_after_cursor_check.setToolTip("Show only toolpath up to the current line in the G-code editor.")
+        self.hide_after_cursor_check.toggled.connect(self._update_preview_limit)
+        preview_row.addWidget(self.hide_after_cursor_check)
+        self.cursor_line_label = QLabel("Cursor line: 1")
+        preview_row.addWidget(self.cursor_line_label, stretch=1)
+        fit_btn = QPushButton("Fit View")
+        fit_btn.clicked.connect(self._fit_preview)
+        preview_row.addWidget(fit_btn)
+        preview_layout.addLayout(preview_row)
+        right_splitter.addWidget(preview_group)
+
+        editor_group = QGroupBox("Unlooped G-code")
+        editor_layout = QVBoxLayout(editor_group)
+        self.code_editor = QPlainTextEdit()
+        self.code_editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.code_editor.setStyleSheet("font-family:Consolas,monospace; font-size:11px;")
+        self.code_editor.setCenterOnScroll(True)
+        self.code_editor.cursorPositionChanged.connect(self._update_preview_limit)
+        self.code_editor.textChanged.connect(self._invalidate_code_line_index)
+        self._code_line_index = None
+        editor_layout.addWidget(self.code_editor)
+        edit_row = QHBoxLayout()
+        self.reload_code_btn = QPushButton("Reload Output Code")
+        self.reload_code_btn.clicked.connect(self._load_code_editor)
+        edit_row.addWidget(self.reload_code_btn)
+        self.replot_btn = QPushButton("Replot Edited Code")
+        self.replot_btn.setToolTip("Reprocess the edited code and return to the same line, zoom and position.")
+        self.replot_btn.setEnabled(False)
+        self.replot_btn.clicked.connect(lambda: self._replot_edited(keep_place=True))
+        edit_row.addWidget(self.replot_btn)
+        self.replot_all_btn = QPushButton("Replot All")
+        self.replot_all_btn.setToolTip("Reprocess the edited code and show the whole toolpath from the top.")
+        self.replot_all_btn.setEnabled(False)
+        self.replot_all_btn.clicked.connect(lambda: self._replot_edited(keep_place=False))
+        edit_row.addWidget(self.replot_all_btn)
+        editor_layout.addLayout(edit_row)
+        right_splitter.addWidget(editor_group)
 
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(5000)
         self.log.setStyleSheet("font-family:Consolas,monospace; font-size:11px;")
         right_splitter.addWidget(self.log)
-        right_splitter.setStretchFactor(0, 3)
-        right_splitter.setStretchFactor(1, 2)
+        right_splitter.setChildrenCollapsible(False)
+        right_splitter.setSizes([440, 360, 220])
+        right_splitter.setStretchFactor(0, 4)
+        right_splitter.setStretchFactor(1, 3)
+        right_splitter.setStretchFactor(2, 2)
 
         splitter.addWidget(left)
         splitter.addWidget(right_splitter)
+        splitter.setChildrenCollapsible(False)
+        splitter.setSizes([360, 840])
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         root.addWidget(splitter, stretch=1)
@@ -255,6 +420,11 @@ class UnlooperWindow(QMainWindow):
         if item is not None:
             item.setText(f"{Path(self.input_files[index]).name}  —  {status}")
 
+    def _update_option_states(self):
+        unloop_only = self.unloop_only_check.isChecked()
+        self.motion_only_check.setEnabled(not unloop_only)
+        self.render_mode_combo.setEnabled(not unloop_only and not self.motion_only_check.isChecked())
+
     def _update_run_enabled(self):
         running = self.process is not None and self.process.state() != QProcess.ProcessState.NotRunning
         self.run_btn.setEnabled(bool(self.input_files) and not running)
@@ -266,8 +436,12 @@ class UnlooperWindow(QMainWindow):
         self._run_completed = False
         for lbl in self._result_labels.values():
             lbl.setText("—")
-        self.preview_label.setText("No image yet — run without “Unloop only” to render one")
-        self.preview_label.setPixmap(QPixmap())
+        self.preview_view.scene().clear()
+        self._clear_preview_state()
+        self.code_editor.clear()
+        self.cursor_line_label.setText("Cursor line: 1")
+        self.replot_btn.setEnabled(False)
+        self.replot_all_btn.setEnabled(False)
         self.output_folder_btn.setEnabled(False)
 
     # ── Run / cancel ─────────────────────────────────────────────────────
@@ -334,9 +508,11 @@ class UnlooperWindow(QMainWindow):
         self.process.setWorkingDirectory(str(self.output_base_dir))
         self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self.process.setProgram(sys.executable)
-        # Arguments are: Unlooper.py <file> <unloop_only> <feedrate> <density> <fibre_diameter>
+        # Arguments are: Unlooper.py <file> <unloop_only> <feedrate> <density> <fibre_diameter> <render_mode>
         # Restored to provide more user control over the material estimate, as per the recent edits in Unlooper.py
-        self.process.setArguments([str(UNLOOPER_SCRIPT), self._active_file, unloop_only, feedrate, density, fibre_diameter])
+        render_mode = "none" if self.motion_only_check.isChecked() else self.render_mode_combo.currentData()
+        self._run_render_mode = render_mode
+        self.process.setArguments([str(UNLOOPER_SCRIPT), self._active_file, unloop_only, feedrate, density, fibre_diameter, render_mode])
         self.process.readyReadStandardOutput.connect(self._on_output)
         self.process.finished.connect(self._on_finished)
         self.process.errorOccurred.connect(self._on_process_error)
@@ -397,11 +573,15 @@ class UnlooperWindow(QMainWindow):
             self.status_label.setText("Done")
             self.progress_bar.setValue(100)
             self._load_preview()
+            self._load_code_editor()
+            if self._pending_place is not None:
+                self._restore_place(self._pending_place)
             self._set_queue_status(self._queue_index, "Done")
         else:
             self.status_label.setText(f"Failed (exit code {exit_code}) — see log")
             self._set_queue_status(self._queue_index, "Failed")
         self.output_folder_btn.setEnabled(self._output_dir().exists())
+        self._pending_place = None
 
         if self._batch_cancelled:
             self._update_run_enabled()
@@ -412,48 +592,237 @@ class UnlooperWindow(QMainWindow):
     def _on_process_error(self, error):
         self.log.appendPlainText(f"[process error] {error}")
 
+    def _clear_preview_state(self):
+        if hasattr(self, "preview_view"):
+            self.preview_view.grid_rect = None
+        self._preview_segments = None
+        self._preview_lines = None
+        self._preview_chunk_items = []
+        self._preview_partial_items = []
+        self._preview_partial_key = None
+        self._preview_colours = {}
+
     def _load_preview(self):
+        scene = self.preview_view.scene()
+        scene.clear()
+        self._clear_preview_state()
+        mode = self._run_render_mode
+        if mode in ("preview", "both") and self._load_vector_preview():
+            return
+        if mode in ("precise", "both") and self._load_raster_preview():
+            return
+        if mode == "none":
+            self.status_label.setText("Done - plotting skipped (motion calcs only)")
+        else:
+            self.status_label.setText("No preview was generated for this run")
+
+    def _load_vector_preview(self):
+        scene = self.preview_view.scene()
+        seg_path = self._output_dir() / f"{self._stem()}_preview_segments.npz"
+        if seg_path.exists():
+            data = np.load(seg_path)
+            segments = data["segments"]
+            if len(segments) == 0:
+                return False
+            self._preview_segments = segments
+            self._preview_lines = segments[:, 8]
+            self._preview_colours = {k: QColor(*map(int, c)) for k, c in zip((1, 2, 3), data["colours"])}
+            view = self.preview_view
+            view.plate_brush = QColor(*map(int, data["background"]))
+            if "grid_colour" in data:
+                view.grid_pen = QPen(QColor(*map(int, data["grid_colour"])), 0)
+                view.grid_spacing = float(data["grid_spacing"])
+            for start in range(0, len(segments), PREVIEW_CHUNK):
+                self._preview_chunk_items.append(self._add_path_items(segments[start:start + PREVIEW_CHUNK]))
+            # Build plate = toolpath extents rounded out to whole grid squares plus a 1 mm
+            # border, matching the PNG's plate
+            bounds = scene.itemsBoundingRect()
+            step = view.grid_spacing
+            left = math.floor(bounds.left() / step) * step - step
+            top = math.floor(bounds.top() / step) * step - step
+            right = math.ceil(bounds.right() / step) * step + step
+            bottom = math.ceil(bounds.bottom() / step) * step + step
+            view.grid_rect = QRectF(left, top, right - left, bottom - top)
+            scene.setSceneRect(view.grid_rect)
+            self._fit_preview()
+            self._update_preview_limit()
+            return True
+
+        # Older runs only have the SVG - show it as a single item (no per-line hiding)
+        svg_path = self._output_dir() / f"{self._stem()}_preview.svg"
+        if svg_path.exists():
+            item = QGraphicsSvgItem(str(svg_path))
+            if item.renderer().isValid():
+                scene.addItem(item)
+                scene.setSceneRect(item.boundingRect())
+                self._fit_preview()
+                return True
+        return False
+
+    def _add_path_items(self, segments):
+        scene = self.preview_view.scene()
+        items = []
+        for kind, path in build_toolpath_paths(segments).items():
+            item = QGraphicsPathItem(path)
+            item.setPen(QPen(self._preview_colours.get(kind, QColor("white")), 0))  # width 0 = cosmetic hairline
+            scene.addItem(item)
+            items.append(item)
+        return items
+
+    def _load_raster_preview(self):
         image_path = self._output_dir() / f"{self._stem()}_cv2_Image_output.png"
-        if image_path.exists():
-            preview_size = self.preview_label.size()
-            if preview_size.width() <= 0 or preview_size.height() <= 0:
-                preview_size = QSize(1400, 900)
+        if not image_path.exists():
+            return False
+        preview_size = self.preview_view.size()
+        if preview_size.width() <= 0 or preview_size.height() <= 0:
+            preview_size = QSize(1400, 900)
 
-            image = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
-            if image is not None:
-                height, width = image.shape[:2]
-                max_width = max(1, min(preview_size.width(), 1600))
-                max_height = max(1, min(preview_size.height(), 1600))
-                scale = min(max_width / width, max_height / height, 1.0)
-                if scale < 1.0:
-                    target_width = max(1, int(width * scale))
-                    target_height = max(1, int(height * scale))
-                    image = cv2.resize(image, (target_width, target_height), interpolation=cv2.INTER_AREA)
+        image = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
+        if image is None:
+            return False
+        height, width = image.shape[:2]
+        max_width = max(1, min(preview_size.width(), 1600))
+        max_height = max(1, min(preview_size.height(), 1600))
+        scale = min(max_width / width, max_height / height, 1.0)
+        if scale < 1.0:
+            target_width = max(1, int(width * scale))
+            target_height = max(1, int(height * scale))
+            image = cv2.resize(image, (target_width, target_height), interpolation=cv2.INTER_AREA)
 
-                if len(image.shape) == 2:
-                    qimage = QImage(image.data, image.shape[1], image.shape[0], image.strides[0], QImage.Format_Grayscale8)
-                else:
-                    rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                    qimage = QImage(rgb_image.data, rgb_image.shape[1], rgb_image.shape[0], rgb_image.strides[0], QImage.Format_RGB888)
+        if len(image.shape) == 2:
+            qimage = QImage(image.data, image.shape[1], image.shape[0], image.strides[0], QImage.Format_Grayscale8)
+        else:
+            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            qimage = QImage(rgb_image.data, rgb_image.shape[1], rgb_image.shape[0], rgb_image.strides[0], QImage.Format_RGB888)
+        if qimage.isNull():
+            return False
+        scene = self.preview_view.scene()
+        pixmap_item = scene.addPixmap(QPixmap.fromImage(qimage))
+        scene.setSceneRect(pixmap_item.boundingRect())
+        self._fit_preview()
+        return True
 
-                if not qimage.isNull():
-                    pixmap = QPixmap.fromImage(qimage)
-                    self.preview_label.setPixmap(
-                        pixmap.scaled(
-                            self.preview_label.size(),
-                            Qt.AspectRatioMode.KeepAspectRatio,
-                            Qt.TransformationMode.SmoothTransformation,
-                        )
-                    )
-                    return
-        self.preview_label.setText("No image was generated for this run")
+    def _fit_preview(self):
+        scene = self.preview_view.scene()
+        if scene.items():
+            self.preview_view.fitInView(scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if self._run_completed and (
-            self.process is None or self.process.state() == QProcess.ProcessState.NotRunning
-        ):
-            self._load_preview()
+    def _invalidate_code_line_index(self):
+        self._code_line_index = None
+
+    def _editor_line_to_code_index(self, block):
+        # The editor holds the saved file, which has comment lines (the ; header with time,
+        # size and material, plus any comments added while editing) that Unlooper.py drops
+        # before plotting. Map the editor line to the index of the last real code line at or
+        # before it. Built lazily and cached until the text changes.
+        if self._code_line_index is None:
+            lines = self.code_editor.toPlainText().split("\n")
+            flags = np.fromiter((is_code_line(line) for line in lines), dtype=bool, count=len(lines))
+            self._code_line_index = np.cumsum(flags) - 1
+        if len(self._code_line_index) == 0:
+            return -1
+        return int(self._code_line_index[min(block, len(self._code_line_index) - 1)])
+
+    def _update_preview_limit(self):
+        cursor_line = self.code_editor.textCursor().blockNumber()
+        self.cursor_line_label.setText(f"Cursor line: {cursor_line + 1}")
+        if self._preview_segments is None:
+            return
+        if self.hide_after_cursor_check.isChecked():
+            # Show everything up to and including the code line the cursor is on
+            self._set_preview_line_limit(self._editor_line_to_code_index(cursor_line))
+        else:
+            self._set_preview_line_limit(None)
+
+    def _set_preview_line_limit(self, max_line):
+        # Whole chunks are shown/hidden; only the chunk the cursor falls inside is rebuilt
+        total = len(self._preview_segments)
+        if max_line is None:
+            visible = total
+        else:
+            visible = int(np.searchsorted(self._preview_lines, max_line, side="right"))
+        full_chunks = visible // PREVIEW_CHUNK
+        for index, items in enumerate(self._preview_chunk_items):
+            show = index < full_chunks or visible == total
+            for item in items:
+                item.setVisible(show)
+
+        partial_key = visible if (visible < total and visible % PREVIEW_CHUNK) else None
+        if partial_key == self._preview_partial_key:
+            return
+        scene = self.preview_view.scene()
+        for item in self._preview_partial_items:
+            scene.removeItem(item)
+        self._preview_partial_items = []
+        self._preview_partial_key = partial_key
+        if partial_key is not None:
+            start = full_chunks * PREVIEW_CHUNK
+            self._preview_partial_items = self._add_path_items(self._preview_segments[start:visible])
+
+    def _load_code_editor(self):
+        code_path = self._output_dir() / f"{self._stem()}_Unlooped_Code.txt"
+        if code_path.exists():
+            self.code_editor.setPlainText(code_path.read_text(encoding="utf-8"))
+            self.replot_btn.setEnabled(True)
+            self.replot_all_btn.setEnabled(True)
+
+    def _capture_place(self):
+        # Remember where the user is so a replot can put them back there. The editor
+        # position is stored as a code-line index (not a raw editor line) because the
+        # reprocessed file drops added comments and rewrites the ; header block.
+        cursor = self.code_editor.textCursor()
+        block = cursor.blockNumber()
+        view = self.preview_view
+        return {
+            "code_index": self._editor_line_to_code_index(block),
+            "column": cursor.positionInBlock(),
+            "scroll_offset": block - self.code_editor.verticalScrollBar().value(),
+            "transform": view.transform() if view.scene().items() else None,
+            "centre": view.mapToScene(view.viewport().rect().center()),
+        }
+
+    def _restore_place(self, place):
+        if self.code_editor.document().isEmpty():
+            return
+        self._code_line_index = None
+        self._editor_line_to_code_index(0)  # rebuild the line map for the new text
+        line_map = self._code_line_index
+        if place["code_index"] < 0:
+            block = 0
+        else:
+            # First editor line whose code index reaches the saved one = that code line
+            block = min(int(np.searchsorted(line_map, place["code_index"], side="left")), len(line_map) - 1)
+        text_block = self.code_editor.document().findBlockByNumber(block)
+        cursor = QTextCursor(text_block)
+        cursor.movePosition(QTextCursor.MoveOperation.Right, n=min(place["column"], text_block.length() - 1))
+        self.code_editor.setTextCursor(cursor)
+        self.code_editor.verticalScrollBar().setValue(max(0, block - place["scroll_offset"]))
+        if place["transform"] is not None and self.preview_view.scene().items():
+            self.preview_view.setTransform(place["transform"])
+            self.preview_view.centerOn(place["centre"])
+
+    def _replot_edited(self, keep_place=True):
+        if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
+            return
+        if not self.code_editor.toPlainText().strip() or not self._active_file:
+            return
+        self._pending_place = self._capture_place() if keep_place else None
+        edit_dir = self.output_base_dir / ".unlooper_edits"
+        edit_dir.mkdir(parents=True, exist_ok=True)
+        # Don't stack suffixes (X_edited_edited...) on repeated replots
+        stem = Path(self._active_file).stem
+        if stem.endswith("_edited"):
+            stem = stem[:-len("_edited")]
+        edited_path = edit_dir / f"{stem}_edited.gcode"
+        edited_path.write_text(self.code_editor.toPlainText(), encoding="utf-8")
+        self.unloop_only_check.setChecked(False)
+        self.input_files = [str(edited_path)]
+        self.queue_list.clear()
+        self.queue_list.addItem(edited_path.name)
+        self._queue_index = -1
+        self.log.clear()
+        self._batch_cancelled = False
+        self._run_next_file()
 
     # ── Output folder ────────────────────────────────────────────────────
 

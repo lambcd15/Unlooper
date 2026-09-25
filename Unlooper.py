@@ -201,7 +201,7 @@ if __name__ == "__main__":
         "Edit_Output": "",
         "Image_name": "",
         "Image": [],
-        "Preview_segments": [], # Numeric toolpath geometry (kind, x1, y1, x2, y2, cx, cy, sweep) for the fast preview
+        "Preview_segments": [], # Numeric toolpath geometry plus source line for the fast preview
         # Array's
         "File_contents": [],
         "File_contents_edited": [], # This can be updated with the latest functions edit
@@ -795,6 +795,11 @@ if __name__ == "__main__":
                                         break
             # pointer += 1
             current_line = params["File_contents_edited"][pointer]
+            # A line that starts with whitespace is normally a coordinate-only continuation
+            # ("  X10 Y5") that inherits the previous command, but " G2 X0 Y-1" already has its
+            # own command - strip the indent so it isn't turned into "G3 G2 X0 Y-1"
+            if current_line.lstrip()[:1] in ("G", "M", "D", "F", "O"):
+                current_line = current_line.lstrip()
             # # Testing
             # # print(params["M98_Array"]_variable)
             # # print( params["O_Array"])
@@ -1083,6 +1088,28 @@ if __name__ == "__main__":
         else:
             return 1
 
+    def record_preview_segment(params, variables, kind, x1, y1, x2, y2, cx=0.0, cy=0.0, full_circle=False):
+        # Store one move for the vector preview (µm, y already flipped to screen/y-down).
+        # Only recorded in the motion-calculation pass - Plot_code re-reads the same lines in a
+        # shifted frame, so recording there too would double every segment in "both" mode.
+        if not variables["Generate_preview_image"] or variables["calc_only"] != 1:
+            return
+        sweep = 0.0
+        if kind in (2, 3):
+            # Sweep in degrees using Qt's arcTo convention: +ve = anticlockwise on screen.
+            # G2 is clockwise on screen, G3 anticlockwise.
+            a1 = math.degrees(math.atan2(cy - y1, x1 - cx))
+            a2 = math.degrees(math.atan2(cy - y2, x2 - cx))
+            if full_circle:
+                sweep = 360.0
+            elif kind == 2:
+                sweep = (a1 - a2) % 360.0
+            else:
+                sweep = (a2 - a1) % 360.0
+            if kind == 2:
+                sweep = -sweep
+        params["Preview_segments"].append((kind, x1, y1, x2, y2, cx, cy, sweep, params.get("Preview_line_number", 0)))
+
     def Plotting_G1_2D(params, variables):
         # This function plots G1 commands as well as calculating the distance reuquired for each command
         # New idea 3/03/2023 keep all units at floats in µm then at the last second before plotting convert but keep in DRO as correct units (pixel_cords)
@@ -1143,8 +1170,7 @@ if __name__ == "__main__":
                 draw_line(params, variables)
             else:  # Scatter command
                 params, variables = doline(params, variables)
-        if variables["Generate_preview_image"]:
-            params["Preview_segments"].append((1, variables["Current_X"], variables["Current_Y"], temp1_x, temp1_y, 0.0, 0.0, 1))
+        record_preview_segment(params, variables, 1, variables["Current_X"], variables["Current_Y"], temp1_x, temp1_y)
         variables["Current_X"] = round(temp1_x,2)
         variables["Current_Y"] = round(temp1_y,2)
         return params, variables
@@ -1190,6 +1216,9 @@ if __name__ == "__main__":
         q = math.sqrt((params["X2"] - variables["Current_X"]) ** 2 + (params["Y2"] - variables["Current_Y"]) ** 2)
         params["Y3"] = (variables["Current_Y"] + params["Y2"]) / 2
         params["X3"] = (variables["Current_X"] + params["X2"]) / 2
+
+        if q == 0 and params["I_increase"] == 0 and params["J_increase"] == 0:
+            return params, variables
         
         if (params["Line"].find("J", 0, len(params["Line"])) != -1 or params["Line"].find("I", 0, len(params["Line"])) != -1):
             # Determine the radius and center using I and J and then check the radius against both pos to check for failure
@@ -1239,8 +1268,7 @@ if __name__ == "__main__":
                 params["Distance"] = math.pi * params["Radius"] * 2
                 params["dir"] = 2
                 params, variables = docircle(params, variables, flag=1)
-            if variables["Generate_preview_image"]:
-                params["Preview_segments"].append((2, variables["Current_X"], variables["Current_Y"], temp2_x, temp2_y, params["X"], params["Y"], 1))
+            record_preview_segment(params, variables, 2, variables["Current_X"], variables["Current_Y"], temp2_x, temp2_y, params["X"], params["Y"], full_circle=True)
         else:
             # Determine the start and end angle of the arc
             if params["Line"].find("J", 0, len(params["Line"])) != -1 or params["Line"].find("I", 0, len(params["Line"])) != -1:
@@ -1290,8 +1318,7 @@ if __name__ == "__main__":
                 params["Distance"] = (math.pi * params["Radius"] * 2) * (params["Diff"] / 360.0)
                 params["dir"] = 2
                 params, variables = docircle(params, variables)
-            if variables["Generate_preview_image"]:
-                params["Preview_segments"].append((2, variables["Current_X"], variables["Current_Y"], temp2_x, temp2_y, params["X"], params["Y"], 1))
+            record_preview_segment(params, variables, 2, variables["Current_X"], variables["Current_Y"], temp2_x, temp2_y, params["X"], params["Y"])
         variables["Current_X"] = temp2_x
         variables["Current_Y"] = temp2_y
         # Append the centre of the circle to the command as a comment
@@ -1335,6 +1362,9 @@ if __name__ == "__main__":
         q = math.sqrt((params["X2"] - variables["Current_X"]) ** 2 + (params["Y2"] - variables["Current_Y"]) ** 2)
         params["Y3"] = (variables["Current_Y"] + params["Y2"]) / 2
         params["X3"] = (variables["Current_X"] + params["X2"]) / 2
+
+        if q == 0 and params["I_increase"] == 0 and params["J_increase"] == 0:
+            return params, variables
         if (params["Line"].find("J", 0, len(params["Line"])) != -1 or params["Line"].find("I", 0, len(params["Line"])) != -1):
             # Determine the radius and center using I and J and then check the radius against both points to check for failure
             params["Radius"] = math.sqrt(params["I_increase"]**2 + params["J_increase"]**2)
@@ -1381,8 +1411,7 @@ if __name__ == "__main__":
                 params["Distance"] = math.pi * params["Radius"] * 2
                 params["dir"] = 3
                 params, variables = docircle(params, variables, flag=1)
-            if variables["Generate_preview_image"]:
-                params["Preview_segments"].append((3, variables["Current_X"], variables["Current_Y"], temp3_x, temp3_y, params["X"], params["Y"], -1))
+            record_preview_segment(params, variables, 3, variables["Current_X"], variables["Current_Y"], temp3_x, temp3_y, params["X"], params["Y"], full_circle=True)
         else:
             # Determine the start and end angle of the arc
             if params["Line"].find("J", 0, len(params["Line"])) != -1 or params["Line"].find("I", 0, len(params["Line"])) != -1:
@@ -1431,8 +1460,7 @@ if __name__ == "__main__":
                 params["Distance"] = (math.pi * params["Radius"] * 2) * (params["Diff"] / 360.0)
                 params["dir"] = 3
                 params, variables = docircle(params, variables)
-            if variables["Generate_preview_image"]:
-                params["Preview_segments"].append((3, variables["Current_X"], variables["Current_Y"], temp3_x, temp3_y, params["X"], params["Y"], -1))
+            record_preview_segment(params, variables, 3, variables["Current_X"], variables["Current_Y"], temp3_x, temp3_y, params["X"], params["Y"])
         variables["Current_X"] = temp3_x
         variables["Current_Y"] = temp3_y
         return params, variables
@@ -1530,6 +1558,9 @@ if __name__ == "__main__":
         params["Command_flag"] = ""
         params["Command_number"] = 0
         params["Edited_line"] = ""
+        # Reset so a command that doesn't move (a bare "G3", "G1 F320", a zero-length arc)
+        # adds 0 to the distance/time totals instead of re-adding the previous move's length
+        params["Distance"] = 0
         # Segment the params["Line"] into seperate cells
         params, variables = segment_line(params, variables)
 
@@ -1722,109 +1753,106 @@ if __name__ == "__main__":
             cv2.imwrite(params["Image_name"], params["Image"])
 
     def render_preview_svg(params, variables):
-        # NCViewer-style toolpath preview, as a vector image. A raster preview is always
-        # a fixed pixel grid - zoom in far enough and it blocks up into squares no matter
-        # how high its resolution is set (this is what a PNG-based first cut of this
-        # feature did, and it's why it's gone). SVG has no such ceiling: arcs are emitted
-        # as exact SVG arc commands (never flattened into a polyline), and strokes use
-        # vector-effect="non-scaling-stroke" so the line stays hairline-thin at any zoom
-        # instead of growing with it. The GUI embeds this directly with live pan/zoom;
-        # it can also be opened in any browser for the same result.
+        # NCViewer-style toolpath preview, as a vector image. Unlike the raster output it has
+        # no resolution ceiling: arcs are exact SVG arc commands and strokes use
+        # vector-effect="non-scaling-stroke" so they stay hairline-thin at any zoom.
+        # Two files are written:
+        #   _preview.svg          - for opening in a browser / other tools
+        #   _preview_segments.npz - the raw segment table the GUI draws from directly
+        #                           (much faster than having Qt parse a large SVG)
         segs = params["Preview_segments"]
-        _kind_names = {0: "G0", 1: "G1", 2: "G2", 3: "G3"}
-        _kind_counts = {k: 0 for k in _kind_names}
-        for _kind, *_ in segs:
-            _kind_counts[_kind] = _kind_counts.get(_kind, 0) + 1
-
         if not segs:
-            print("Debug: render_preview_svg got zero segments; skipping SVG output.")
+            print("No toolpath segments recorded; skipping preview output.")
             return
 
-        xs = [p for seg in segs for p in (seg[1], seg[3])]
-        ys = [p for seg in segs for p in (seg[2], seg[4])]
-        if not xs:
-            print("Debug: render_preview_svg found no drawable coordinates; skipping SVG output.")
-            return
+        out_base = "Output/" + params["Filename_only"] + "/" + params["Filename_only"]
 
-        min_x, max_x = min(xs), max(xs)
-        min_y, max_y = min(ys), max(ys)
+        # cv2 colours are BGR - convert so the preview matches the PNG output
+        def to_rgb(colour):
+            return (int(colour[2]), int(colour[1]), int(colour[0]))
+
+        colours = {
+            1: to_rgb(variables["G1_colour"]),
+            2: to_rgb(variables["G2_colour"]),
+            3: to_rgb(variables["G3_colour"]),
+        }
+        background = to_rgb(variables["Background_colour"])
+
+        seg_array = np.asarray(segs, dtype=np.float64)
+        np.savez(out_base + "_preview_segments.npz",
+                 segments=seg_array.astype(np.float32),
+                 colours=np.array([colours[1], colours[2], colours[3]], dtype=np.uint8),
+                 background=np.array(background, dtype=np.uint8),
+                 # Same grid as draw_grid() puts on the PNG: light grey lines every 1 mm (1000 µm)
+                 grid_colour=np.array(to_rgb((220, 220, 220)), dtype=np.uint8),
+                 grid_spacing=np.float64(1000.0))
+
+        min_x = float(min(seg_array[:, 1].min(), seg_array[:, 3].min()))
+        max_x = float(max(seg_array[:, 1].max(), seg_array[:, 3].max()))
+        min_y = float(min(seg_array[:, 2].min(), seg_array[:, 4].min()))
+        max_y = float(max(seg_array[:, 2].max(), seg_array[:, 4].max()))
         margin = max(max_x - min_x, max_y - min_y, 1.0) * 0.02
         vb_x, vb_y = min_x - margin, min_y - margin
         vb_w, vb_h = max_x - min_x + 2 * margin, max_y - min_y + 2 * margin
 
-        def rgb(colour):
-            return f"rgb({colour[0]}, {colour[1]}, {colour[2]})"
-
-        colours = {
-            0: (180, 180, 180),
-            1: variables["G1_colour"],
-            2: variables["G2_colour"],
-            3: variables["G3_colour"],
-        }
-
-        commands = {0: [], 1: [], 2: [], 3: []}
-        for kind, x1, y1, x2, y2, cx, cy, sweep in segs:
-            if kind == 1:
-                commands[1].append(f"M {x1:.3f} {y1:.3f} L {x2:.3f} {y2:.3f}")
-            elif kind in (2, 3):
-                radius = math.hypot(x1 - cx, y1 - cy)
-                start_angle = math.degrees(math.atan2(y1 - cy, x1 - cx))
-                end_angle = math.degrees(math.atan2(y2 - cy, x2 - cx))
-                if kind == 2 and sweep < 0:
-                    sweep_flag = 0
-                elif kind == 2:
-                    sweep_flag = 1
-                elif kind == 3 and sweep < 0:
-                    sweep_flag = 0
-                else:
-                    sweep_flag = 1
-                commands[kind].append(
-                    f"M {x1:.3f} {y1:.3f} A {radius:.3f} {radius:.3f} 0 0 {sweep_flag} {x2:.3f} {y2:.3f}"
-                )
-
         parts = [
-            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{vb_x:.3f} {vb_y:.3f} {vb_w:.3f} {vb_h:.3f}">',
-            f'<rect x="{vb_x:.3f}" y="{vb_y:.3f}" width="{vb_w:.3f}" height="{vb_h:.3f}" fill="{rgb(variables["Background_colour"])}"/>',
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{vb_x:.2f} {vb_y:.2f} {vb_w:.2f} {vb_h:.2f}">',
+            f'<rect x="{vb_x:.2f}" y="{vb_y:.2f}" width="{vb_w:.2f}" height="{vb_h:.2f}" fill="rgb{background}"/>',
         ]
 
+        # Faint background grid, starting at 1 mm and doubling until there are <= 40 lines
         spacing, max_lines = 1000.0, 40
         while vb_w / spacing > max_lines or vb_h / spacing > max_lines:
             spacing *= 2
         grid = []
         gx = math.floor(vb_x / spacing) * spacing
         while gx <= vb_x + vb_w:
-            grid.append(f'<line x1="{gx:.3f}" y1="{vb_y:.3f}" x2="{gx:.3f}" y2="{vb_y + vb_h:.3f}" stroke="rgba(0,0,0,0.08)" stroke-width="0.5"/>')
+            grid.append(f"M {gx:.2f} {vb_y:.2f} V {vb_y + vb_h:.2f}")
             gx += spacing
         gy = math.floor(vb_y / spacing) * spacing
         while gy <= vb_y + vb_h:
-            grid.append(f'<line x1="{vb_x:.3f}" y1="{gy:.3f}" x2="{vb_x + vb_w:.3f}" y2="{gy:.3f}" stroke="rgba(0,0,0,0.08)" stroke-width="0.5"/>')
+            grid.append(f"M {vb_x:.2f} {gy:.2f} H {vb_x + vb_w:.2f}")
             gy += spacing
-        if grid:
-            parts.extend(grid)
+        parts.append(f'<path d="{" ".join(grid)}" fill="none" stroke="rgba(0,0,0,0.08)" vector-effect="non-scaling-stroke"/>')
 
-        max_chunk_chars = 200_000
-        chunk_counts = {k: 0 for k in (0, 1, 2, 3)}
-        for kind in (0, 1, 2, 3):
-            chunk = commands.get(kind, [])
-            if not chunk:
-                continue
-            for idx in range(0, len(chunk), 1):
-                segment = chunk[idx]
-                if len(segment) > max_chunk_chars:
-                    large_parts = [segment[i:i + max_chunk_chars] for i in range(0, len(segment), max_chunk_chars)]
-                    for part in large_parts:
-                        parts.append(f'<path d="{part}" fill="none" stroke="{rgb(colours[kind])}" stroke-width="0.8" vector-effect="non-scaling-stroke"/>')
-                        chunk_counts[kind] += 1
+        # Segments are written in chunks of consecutive moves, one <path> per move type per
+        # chunk, with continuous moves joined into a single sub-path. This keeps the element
+        # count small (a <path> per line made large files unusable) while each <g> still
+        # records which G-code lines it covers.
+        chunk_size = 2000
+        for start in range(0, len(segs), chunk_size):
+            chunk = segs[start:start + chunk_size]
+            paths = {1: [], 2: [], 3: []}
+            last_end = {}
+            for kind, x1, y1, x2, y2, cx, cy, sweep, _line in chunk:
+                d = paths[kind]
+                if last_end.get(kind) != (x1, y1):
+                    d.append(f"M{x1:.2f} {y1:.2f}")
+                if kind == 1:
+                    d.append(f"L{x2:.2f} {y2:.2f}")
                 else:
-                    parts.append(f'<path d="{segment}" fill="none" stroke="{rgb(colours[kind])}" stroke-width="0.8" vector-effect="non-scaling-stroke"/>')
-                    chunk_counts[kind] += 1
+                    radius = math.hypot(x1 - cx, y1 - cy)
+                    sweep_flag = 1 if sweep < 0 else 0  # SVG sweep 1 = clockwise on screen
+                    if abs(sweep) >= 360.0:
+                        # SVG can't draw a full circle as one arc (same start and end) - use two halves
+                        ox, oy = 2 * cx - x1, 2 * cy - y1
+                        d.append(f"A{radius:.2f} {radius:.2f} 0 0 {sweep_flag} {ox:.2f} {oy:.2f}")
+                        d.append(f"A{radius:.2f} {radius:.2f} 0 0 {sweep_flag} {x1:.2f} {y1:.2f}")
+                    else:
+                        large_arc = 1 if abs(sweep) > 180.0 else 0
+                        d.append(f"A{radius:.2f} {radius:.2f} 0 {large_arc} {sweep_flag} {x2:.2f} {y2:.2f}")
+                last_end[kind] = (x2, y2)
+            parts.append(f'<g id="chunk_{start // chunk_size}" data-first-line="{chunk[0][8]}" data-last-line="{chunk[-1][8]}">')
+            for kind in (1, 2, 3):
+                if paths[kind]:
+                    parts.append(f'<path d="{"".join(paths[kind])}" fill="none" stroke="rgb{colours[kind]}" vector-effect="non-scaling-stroke"/>')
+            parts.append("</g>")
 
         parts.append("</svg>")
 
-        out_path = "Output/" + params["Filename_only"] + "/" + params["Filename_only"] + "_preview.svg"
-        svg_text = "\n".join(parts)
+        out_path = out_base + "_preview.svg"
         with open(out_path, "w") as f:
-            f.write(svg_text)
+            f.write("\n".join(parts))
         print("Preview vector saved:", out_path)
 
     def motion_calculations(params, variables):
@@ -1848,9 +1876,10 @@ if __name__ == "__main__":
         params["G2_G3_Edited_output"] = []
         # line_num = 0
         variables["calc_only"] = 1
-        for line in params["Unlooped_contents"]:
+        for preview_line_number, line in enumerate(params["Unlooped_contents"]):
             # Loop through all the lines in the edited contents array
             params["Line"] = line
+            params["Preview_line_number"] = preview_line_number
             params, variables = line_reader(params, variables)
             if params["Edited_line"] != "":
                 params["G2_G3_Edited_output"].append(params["Edited_line"])

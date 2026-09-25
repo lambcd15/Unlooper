@@ -19,3 +19,4 @@ multiprocessing
 moviepy
 natsort
 tqdm
+numba

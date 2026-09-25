@@ -40,11 +40,36 @@ Random Folder
 ```
 
 Command line
-This program can also be run from the command line using 
+This program can also be run from the command line (or through the GUI, `python Unlooper_gui.py`) using
 ```
-python Gcode_processing.py "filename" "Unlooped"
+python Unlooper.py "filename" <unloop_only 0|1> [feedrate mm/min] [density] [fibre diameter um]
+                   [render precise|preview|both|none] [acceleration mm/s2] [junction deviation mm]
+                   [skip pixel coords 1|0] [jerk mm/s] [lag prediction 1|0] [CTS mm/min]
+                   [write lag-format files 1|0]
 ```
-where "filename" is replaced with the filepath and "Unlooped" is reaplced with either 1 or 0 
+Only the first two arguments are required; 0 for an override means "use the file's own value".
+
+## Code layout
+
+`Unlooper.py` holds the settings, the command line and the order the stages run in. The
+stages are in `unlooper_core/`:
+
+| Module | What it does |
+| --- | --- |
+| `gcode_reader.py` | read the file, strip comments, pull out the print parameters, unloop O / M98 / M99 sub-programs |
+| `toolpath.py` | turn each command into tool movement: position tracking, G1 lines, G2 / G3 arcs, distance, time, material |
+| `motion_planner.py` | acceleration-limited moves with junction deviation and / or classic jerk corner speeds |
+| `pixel_coords.py` | nozzle positions every 1 ms along the planned motion; speed / acceleration PNGs |
+| `corner_path.py` | the same with corners rounded as the machine runs them (constant-velocity mode) |
+| `lag_model.py` | jet lag prediction (Ievgenii's python_lag model, compiled with numba) along the corner path |
+| `scaffold_outputs.py` | runs the stages above and totals the results |
+| `rendering.py` | move-type PNG and vector (SVG) preview |
+| `palette.py`, `common.py` | shared colours and helpers |
+
+Outputs in `Output/<name>/` besides the unlooped code and images: `_pixel_cords.csv`,
+`_corner_pixel_cords.csv` (same layout, for the lag model) and their `_motion.csv` companions,
+`_lag.csv` (jet contact point X, Y and lag in mm), `_lag.png` and the `_legend.json` files.
+The lag calibration data is `lag_data/Lag_1.2b_fM.csv`.
 
 ## Setup
 

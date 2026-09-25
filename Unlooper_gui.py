@@ -9,6 +9,7 @@ import that script — it launches it as a child process and parses its
 console output.
 """
 
+import json
 import math
 import os
 import re
@@ -17,7 +18,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, Slot, QSize, QRectF, QLineF
+from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, Slot, QSize, QRectF, QLineF, QSettings
 from PySide6.QtGui import QImage, QPixmap, QPainter, QPainterPath, QPen, QColor, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -31,10 +32,27 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 UNLOOPER_SCRIPT = SCRIPT_DIR / "Unlooper.py"
 
 TQDM_RE = re.compile(r"^\s*(\d+)%\|")
+# "Scaffold outputs progress: 42%", "Pixel coords progress: 42%" from Unlooper.py
+STAGE_PROGRESS_RE = re.compile(r"^(.+) progress:\s*(\d+)%$")
 DISTANCE_RE = re.compile(r"Distance travelled:\s*([\d.]+)\s*m")
 TIME_RE = re.compile(r"Total Time:\s*(.+)")
 MATERIAL_RE = re.compile(r"Material Used:\s*([\d.]+)\s*mg")
 SIZE_RE = re.compile(r"Total size used x:\s*([\-\d.]+)\s*y:\s*([\-\d.]+)")
+TIME_ACCEL_RE = re.compile(r"Total Time \(accel/junction\):\s*(.+)")
+AVG_SPEED_RE = re.compile(r"Average speed \(accel/junction\):\s*([\d.]+)\s*mm/min")
+BELOW_CTS_RE = re.compile(r"Path below CTS:\s*(.+)")
+
+# PrusaSlicer's 11-step legend colours (dark blue = slowest ... dark red = fastest)
+SPEED_COLOURS = [
+    (11, 44, 122), (19, 89, 133), (28, 136, 145), (4, 214, 15), (170, 242, 0), (252, 249, 3),
+    (245, 206, 10), (227, 136, 32), (209, 104, 48), (194, 82, 60), (148, 38, 22),
+]
+# Acceleration view: sign of the acceleration along the path
+ACCEL_COLOURS = {-1: ((19, 89, 133), "Decelerating"), 0: ((150, 150, 150), "Constant speed"), 1: ((209, 104, 48), "Accelerating")}
+
+# Defaults for the GUI settings (remembered between sessions with QSettings)
+DEFAULT_ACCELERATION = 1000.0  # mm/s^2
+DEFAULT_JUNCTION_DEVIATION = 0.013  # mm, Marlin 2's default
 
 # Number of toolpath segments per scene item. Big enough to keep the item count low on
 # large files, small enough that rebuilding the chunk under the cursor is instant.
@@ -46,7 +64,8 @@ def build_toolpath_paths(segments):
     # (kind, x1, y1, x2, y2, cx, cy, sweep_deg, line) as written by Unlooper.py
     paths = {}
     last_end = {}
-    for kind, x1, y1, x2, y2, cx, cy, sweep, _line in segments.tolist():
+    for row in segments.tolist():
+        kind, x1, y1, x2, y2, cx, cy, sweep = row[:8]
         kind = int(kind)
         path = paths.get(kind)
         if path is None:
@@ -78,6 +97,89 @@ def is_code_line(line):
     if "#" in stripped or stripped.upper().startswith("M117"):
         return False
     return True
+
+
+def build_sample_paths(samples, bin_of):
+    # Polyline through the reduced pixel coords (x, y, speed, accel, line) from Unlooper.py,
+    # one QPainterPath per colour bin. The piece from point i to point i+1 takes point i's
+    # colour - Unlooper.py keeps a point wherever the colour changes, so this is exact.
+    paths = {}
+    rows = samples.tolist()
+    last_bin = None
+    for i in range(len(rows) - 1):
+        x, y, speed, accel = rows[i][:4]
+        b = bin_of(speed, accel)
+        path = paths.get(b)
+        if path is None:
+            path = paths[b] = QPainterPath()
+        if b != last_bin or path.currentPosition().x() != x or path.currentPosition().y() != y:
+            path.moveTo(x, y)
+        path.lineTo(rows[i + 1][0], rows[i + 1][1])
+        last_bin = b
+    return paths
+
+
+class SpeedLegend(QWidget):
+    # Colour bar for the actual-speed view, in mm/min to match the G-code F values
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(38)
+        self.speed_range = None
+        self.entries = None
+        self.cts = 0.0
+        self.message = ""
+        self.setToolTip(
+            "Actual speed from the pixel coords spacing (mm/min).\n"
+            "The black tick marks the critical translation speed from the file, if set."
+        )
+
+    def set_range(self, v_min, v_max, cts):
+        self.speed_range = (v_min, v_max)
+        self.entries = None
+        self.cts = cts
+        self.message = ""
+        self.update()
+
+    def set_entries(self, entries):
+        # Discrete legend: list of (rgb, label)
+        self.speed_range = None
+        self.entries = entries
+        self.message = ""
+        self.update()
+
+    def set_message(self, message):
+        self.speed_range = None
+        self.entries = None
+        self.message = message
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setPen(self.palette().windowText().color())
+        if self.entries:
+            width = (self.width() - 16) / len(self.entries)
+            for i, (colour, label) in enumerate(self.entries):
+                left = 8 + i * width
+                painter.fillRect(QRectF(left, 2, width - 6, 14), QColor(*colour))
+                painter.drawText(QRectF(left, 18, width - 6, 18), Qt.AlignmentFlag.AlignHCenter, label)
+            return
+        if self.speed_range is None:
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.message)
+            return
+        bar = QRectF(8, 2, self.width() - 16, 14)
+        bins = len(SPEED_COLOURS)
+        for i, colour in enumerate(SPEED_COLOURS):
+            painter.fillRect(QRectF(bar.left() + bar.width() * i / bins, bar.top(), bar.width() / bins + 1, bar.height()), QColor(*colour))
+        v_min, v_max = self.speed_range
+        text_rect = QRectF(bar.left(), bar.bottom() + 2, bar.width(), 18)
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignLeft, f"{v_min * 60:.1f} mm/min")
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignHCenter, f"{(v_min + v_max) * 30:.1f}")
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignRight, f"{v_max * 60:.1f} mm/min")
+        if self.cts > 0 and v_max > v_min:
+            x = bar.left() + bar.width() * min(max((self.cts - v_min) / (v_max - v_min), 0.0), 1.0)
+            painter.setPen(QPen(QColor("black"), 2))
+            painter.drawLine(QLineF(x, bar.top() - 2, x, bar.bottom() + 2))
 
 
 class ToolpathView(QGraphicsView):
@@ -149,6 +251,7 @@ class UnlooperWindow(QMainWindow):
         self._clear_preview_state()
 
         self._build_ui()
+        self._load_settings()
         self._update_run_enabled()
 
     # ── UI construction ──────────────────────────────────────────────────
@@ -201,6 +304,13 @@ class UnlooperWindow(QMainWindow):
             "Sends render mode 'none' to Unlooper.py."
         )
         opts_layout.addWidget(self.motion_only_check)
+        self.skip_pixel_check = QCheckBox("Skip pixel coords (faster, no speed/acceleration colouring)")
+        self.skip_pixel_check.setToolTip(
+            "Pixel coords place a point every 1 ms along the planned motion, giving the actual\n"
+            "speed and acceleration colouring (and the lag-model pixel coords file).\n"
+            "Skipping them saves a lot of time on long prints; the acceleration-aware time is still given."
+        )
+        opts_layout.addWidget(self.skip_pixel_check)
         render_row = QHBoxLayout()
         render_row.addWidget(QLabel("Render type:"))
         self.render_mode_combo = QComboBox()
@@ -253,6 +363,33 @@ class UnlooperWindow(QMainWindow):
             "Leave at 0 to use the file's fibre diameter / material density."
         )
         overrides_grid.addWidget(self.density_spin, 2, 1)
+
+        overrides_grid.addWidget(QLabel("Acceleration (mm/s²):"), 3, 0)
+        self.accel_spin = QDoubleSpinBox()
+        self.accel_spin.setRange(0, 1_000_000)
+        self.accel_spin.setDecimals(1)
+        self.accel_spin.setSingleStep(10)
+        self.accel_spin.setToolTip(
+            "If > 0, also estimates the time and the real speed along the path with\n"
+            "constant acceleration and junction-deviation corners (Marlin 2 model).\n"
+            "Enables the 'Actual speed' colouring of the preview.\n"
+            "Leave at 0 for the plain distance / feed rate estimate."
+        )
+        overrides_grid.addWidget(self.accel_spin, 3, 1)
+
+        overrides_grid.addWidget(QLabel("Junction deviation (mm):"), 4, 0)
+        self.junction_spin = QDoubleSpinBox()
+        self.junction_spin.setRange(0, 10)
+        self.junction_spin.setDecimals(3)
+        self.junction_spin.setSingleStep(0.001)
+        self.junction_spin.setToolTip(
+            "How much corner rounding the printer may use to keep its speed through a corner\n"
+            "(constant-velocity mode, Marlin 2's junction deviation; default 0.013 mm).\n"
+            "A corner only slows the head if it can't be taken at speed within this rounding\n"
+            "at the acceleration limit. 0 = stop at every change of direction.\n"
+            "Only used when acceleration is > 0."
+        )
+        overrides_grid.addWidget(self.junction_spin, 4, 1)
         left_layout.addWidget(overrides_group)
 
         out_group = QGroupBox("Output Folder")
@@ -291,6 +428,9 @@ class UnlooperWindow(QMainWindow):
             ("time", "Estimated time"),
             ("material", "Material used"),
             ("size", "Build size used (x, y)"),
+            ("time_accel", "Est. time (accel/junction)"),
+            ("avg_speed", "Avg. actual speed"),
+            ("below_cts", "Path below CTS"),
         ]):
             cap = QLabel(caption + ":")
             val = QLabel("—")
@@ -326,10 +466,23 @@ class UnlooperWindow(QMainWindow):
         preview_row.addWidget(self.hide_after_cursor_check)
         self.cursor_line_label = QLabel("Cursor line: 1")
         preview_row.addWidget(self.cursor_line_label, stretch=1)
+        self.colour_mode_combo = QComboBox()
+        self.colour_mode_combo.addItem("Colour: move type", "kind")
+        self.colour_mode_combo.addItem("Colour: actual speed", "speed")
+        self.colour_mode_combo.addItem("Colour: acceleration", "accel")
+        self.colour_mode_combo.setToolTip(
+            "Speed and acceleration come from the pixel coords along the planned motion,\n"
+            "which need Acceleration > 0 on the run (see Overrides)."
+        )
+        self.colour_mode_combo.currentIndexChanged.connect(self._rebuild_preview_items)
+        preview_row.addWidget(self.colour_mode_combo)
         fit_btn = QPushButton("Fit View")
         fit_btn.clicked.connect(self._fit_preview)
         preview_row.addWidget(fit_btn)
         preview_layout.addLayout(preview_row)
+        self.speed_legend = SpeedLegend()
+        self.speed_legend.setVisible(False)
+        preview_layout.addWidget(self.speed_legend)
         right_splitter.addWidget(preview_group)
 
         editor_group = QGroupBox("Unlooped G-code")
@@ -420,10 +573,36 @@ class UnlooperWindow(QMainWindow):
         if item is not None:
             item.setText(f"{Path(self.input_files[index]).name}  —  {status}")
 
+    def _load_settings(self):
+        # Last-used values, with acceleration 1000 mm/s^2 and junction deviation 0.013 mm the first time
+        settings = QSettings("Unlooper", "Unlooper")
+        self.feedrate_spin.setValue(float(settings.value("feedrate", 0.0)))
+        self.fibre_diameter_spin.setValue(float(settings.value("fibre_diameter", 0.0)))
+        self.density_spin.setValue(float(settings.value("density", 0.0)))
+        self.accel_spin.setValue(float(settings.value("acceleration", DEFAULT_ACCELERATION)))
+        self.junction_spin.setValue(float(settings.value("junction_deviation", DEFAULT_JUNCTION_DEVIATION)))
+        self.render_mode_combo.setCurrentIndex(max(0, self.render_mode_combo.findData(settings.value("render_mode", "preview"))))
+        self.motion_only_check.setChecked(settings.value("motion_only", "false") in (True, "true"))
+        self.skip_pixel_check.setChecked(settings.value("skip_pixel_coords", "false") in (True, "true"))
+        self.colour_mode_combo.setCurrentIndex(max(0, self.colour_mode_combo.findData(settings.value("colour_mode", "kind"))))
+
+    def _save_settings(self):
+        settings = QSettings("Unlooper", "Unlooper")
+        settings.setValue("feedrate", self.feedrate_spin.value())
+        settings.setValue("fibre_diameter", self.fibre_diameter_spin.value())
+        settings.setValue("density", self.density_spin.value())
+        settings.setValue("acceleration", self.accel_spin.value())
+        settings.setValue("junction_deviation", self.junction_spin.value())
+        settings.setValue("render_mode", self.render_mode_combo.currentData())
+        settings.setValue("motion_only", self.motion_only_check.isChecked())
+        settings.setValue("skip_pixel_coords", self.skip_pixel_check.isChecked())
+        settings.setValue("colour_mode", self.colour_mode_combo.currentData())
+
     def _update_option_states(self):
         unloop_only = self.unloop_only_check.isChecked()
         self.motion_only_check.setEnabled(not unloop_only)
         self.render_mode_combo.setEnabled(not unloop_only and not self.motion_only_check.isChecked())
+        self.skip_pixel_check.setEnabled(not unloop_only and not self.motion_only_check.isChecked())
 
     def _update_run_enabled(self):
         running = self.process is not None and self.process.state() != QProcess.ProcessState.NotRunning
@@ -469,6 +648,7 @@ class UnlooperWindow(QMainWindow):
             self.status_label.setText(f"Error: cannot find {UNLOOPER_SCRIPT}")
             return
 
+        self._save_settings()
         self.log.clear()
         self._batch_cancelled = False
         self._queue_index = -1
@@ -512,7 +692,11 @@ class UnlooperWindow(QMainWindow):
         # Restored to provide more user control over the material estimate, as per the recent edits in Unlooper.py
         render_mode = "none" if self.motion_only_check.isChecked() else self.render_mode_combo.currentData()
         self._run_render_mode = render_mode
-        self.process.setArguments([str(UNLOOPER_SCRIPT), self._active_file, unloop_only, feedrate, density, fibre_diameter, render_mode])
+        # ... <acceleration mm/s^2> <junction deviation mm> <skip pixel coords>
+        accel = str(self.accel_spin.value())
+        junction = str(self.junction_spin.value())
+        skip_pixel = "1" if self.skip_pixel_check.isChecked() else "0"
+        self.process.setArguments([str(UNLOOPER_SCRIPT), self._active_file, unloop_only, feedrate, density, fibre_diameter, render_mode, accel, junction, skip_pixel])
         self.process.readyReadStandardOutput.connect(self._on_output)
         self.process.finished.connect(self._on_finished)
         self.process.errorOccurred.connect(self._on_process_error)
@@ -543,6 +727,12 @@ class UnlooperWindow(QMainWindow):
                 self.progress_bar.setValue(int(m.group(1)))
                 self.status_label.setText(f"Rendering image… {m.group(1)}%")
                 continue
+            m = STAGE_PROGRESS_RE.match(line)
+            if m:
+                # Progress lines drive the bar and status only, so they don't flood the log
+                self.progress_bar.setValue(int(m.group(2)))
+                self.status_label.setText(f"{m.group(1)}… {m.group(2)}%")
+                continue
             self.log.appendPlainText(line)
             self.status_label.setText(line)
             self._parse_metrics(line)
@@ -560,6 +750,15 @@ class UnlooperWindow(QMainWindow):
         m = SIZE_RE.search(line)
         if m:
             self._result_labels["size"].setText(f"{m.group(1)} mm, {m.group(2)} mm")
+        m = TIME_ACCEL_RE.search(line)
+        if m:
+            self._result_labels["time_accel"].setText(m.group(1).strip())
+        m = AVG_SPEED_RE.search(line)
+        if m:
+            self._result_labels["avg_speed"].setText(f"{m.group(1)} mm/min")
+        m = BELOW_CTS_RE.search(line)
+        if m:
+            self._result_labels["below_cts"].setText(m.group(1).strip())
 
     @Slot(int, QProcess.ExitStatus)
     def _on_finished(self, exit_code, exit_status):
@@ -601,15 +800,28 @@ class UnlooperWindow(QMainWindow):
         self._preview_partial_items = []
         self._preview_partial_key = None
         self._preview_colours = {}
+        self._preview_samples = None
+        self._preview_sample_lines = None
+        self._preview_speed_range = (0.0, 1.0)
+        self._preview_cts = 0.0
+        self._raster_loaded = False
+        self._legend_info = None
 
     def _load_preview(self):
         scene = self.preview_view.scene()
         scene.clear()
         self._clear_preview_state()
+        legend_path = self._output_dir() / f"{self._stem()}_pixel_coords_legend.json"
+        if legend_path.exists():
+            try:
+                self._legend_info = json.loads(legend_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                self._legend_info = None
         mode = self._run_render_mode
         if mode in ("preview", "both") and self._load_vector_preview():
             return
         if mode in ("precise", "both") and self._load_raster_preview():
+            self._update_legend()
             return
         if mode == "none":
             self.status_label.setText("Done - plotting skipped (motion calcs only)")
@@ -632,8 +844,15 @@ class UnlooperWindow(QMainWindow):
             if "grid_colour" in data:
                 view.grid_pen = QPen(QColor(*map(int, data["grid_colour"])), 0)
                 view.grid_spacing = float(data["grid_spacing"])
-            for start in range(0, len(segments), PREVIEW_CHUNK):
-                self._preview_chunk_items.append(self._add_path_items(segments[start:start + PREVIEW_CHUNK]))
+            samples = data["samples"] if "samples" in data else None
+            if samples is not None and len(samples) > 1:
+                self._preview_samples = samples
+                self._preview_sample_lines = samples[:, 4]
+                v_min, v_max = (float(v) for v in data["speed_range"]) if "speed_range" in data else (0.0, 0.0)
+                self._preview_speed_range = (v_min, v_max) if v_max > v_min else (float(samples[:, 2].min()), float(samples[:, 2].max()))
+                self._preview_cts = float(data["cts"]) if "cts" in data else 0.0
+            self._build_all_chunks()
+            self._update_legend()
             # Build plate = toolpath extents rounded out to whole grid squares plus a 1 mm
             # border, matching the PNG's plate
             bounds = scene.itemsBoundingRect()
@@ -659,20 +878,92 @@ class UnlooperWindow(QMainWindow):
                 return True
         return False
 
-    def _add_path_items(self, segments):
+    def _sample_mode(self):
+        # Speed / acceleration colouring draws the pixel coords instead of the G-code moves
+        return self.colour_mode_combo.currentData() in ("speed", "accel") and self._preview_samples is not None
+
+    def _active_lines(self):
+        return self._preview_sample_lines if self._sample_mode() else self._preview_lines
+
+    def _build_all_chunks(self):
+        total = len(self._active_lines())
+        for start in range(0, total, PREVIEW_CHUNK):
+            self._preview_chunk_items.append(self._add_path_items(start, min(start + PREVIEW_CHUNK, total)))
+
+    def _add_path_items(self, start, stop, join_next=True):
         scene = self.preview_view.scene()
+        if self._sample_mode():
+            # Include the next chunk's first point so consecutive chunks join up
+            samples = self._preview_samples[start:stop + 1 if join_next else stop]
+            if self.colour_mode_combo.currentData() == "speed":
+                v_min, v_max = self._preview_speed_range
+                bins = len(SPEED_COLOURS)
+                width = max(v_max - v_min, 1e-9) / bins
+                paths = build_sample_paths(samples, lambda v, a: min(bins - 1, max(0, int((v - v_min) / width))))
+                colours = {b: QColor(*c) for b, c in enumerate(SPEED_COLOURS)}
+            else:
+                paths = build_sample_paths(samples, lambda v, a: (a > 0) - (a < 0))
+                colours = {k: QColor(*c) for k, (c, _label) in ACCEL_COLOURS.items()}
+        else:
+            paths = build_toolpath_paths(self._preview_segments[start:stop])
+            colours = self._preview_colours
         items = []
-        for kind, path in build_toolpath_paths(segments).items():
+        for key, path in paths.items():
             item = QGraphicsPathItem(path)
-            item.setPen(QPen(self._preview_colours.get(kind, QColor("white")), 0))  # width 0 = cosmetic hairline
+            item.setPen(QPen(colours.get(key, QColor("white")), 0))  # width 0 = cosmetic hairline
             scene.addItem(item)
             items.append(item)
         return items
 
+    def _update_legend(self):
+        mode = self.colour_mode_combo.currentData()
+        if mode == "kind":
+            self.speed_legend.setVisible(False)
+            return
+        self.speed_legend.setVisible(True)
+        has_raster_data = self._raster_loaded and self._legend_info is not None
+        if self._preview_samples is None and not has_raster_data:
+            self.speed_legend.set_message("No speed data - run with Acceleration > 0 and 'Skip pixel coords' unticked")
+        elif mode == "speed":
+            if self._preview_samples is None:
+                info = self._legend_info
+                self.speed_legend.set_range(info["speed_min_mm_s"], info["speed_max_mm_s"], info.get("cts_mm_s", 0.0))
+            else:
+                self.speed_legend.set_range(*self._preview_speed_range, self._preview_cts)
+        else:
+            self.speed_legend.set_entries([ACCEL_COLOURS[k] for k in (-1, 0, 1)])
+
+    def _rebuild_preview_items(self):
+        # Re-colour the loaded toolpath (move type / speed / acceleration) without reloading it
+        self._update_legend()
+        if self._preview_segments is None:
+            if self._raster_loaded:
+                # PNG preview: switch to the matching image
+                transform = self.preview_view.transform()
+                self.preview_view.scene().clear()
+                self._load_raster_preview()
+                self.preview_view.setTransform(transform)
+                self._update_legend()
+            return
+        scene = self.preview_view.scene()
+        for items in self._preview_chunk_items + [self._preview_partial_items]:
+            for item in items:
+                scene.removeItem(item)
+        self._preview_chunk_items = []
+        self._preview_partial_items = []
+        self._preview_partial_key = None
+        self._build_all_chunks()
+        self._update_preview_limit()
+
     def _load_raster_preview(self):
-        image_path = self._output_dir() / f"{self._stem()}_cv2_Image_output.png"
+        # Move-type PNG from Plot_code(), or the speed / acceleration PNGs drawn from the pixel coords
+        suffix = {"speed": "_pixel_coords_speed.png", "accel": "_pixel_coords_accel.png"}.get(self.colour_mode_combo.currentData(), "_cv2_Image_output.png")
+        image_path = self._output_dir() / f"{self._stem()}{suffix}"
+        if not image_path.exists():
+            image_path = self._output_dir() / f"{self._stem()}_cv2_Image_output.png"
         if not image_path.exists():
             return False
+        self._raster_loaded = True
         preview_size = self.preview_view.size()
         if preview_size.width() <= 0 or preview_size.height() <= 0:
             preview_size = QSize(1400, 900)
@@ -736,11 +1027,12 @@ class UnlooperWindow(QMainWindow):
 
     def _set_preview_line_limit(self, max_line):
         # Whole chunks are shown/hidden; only the chunk the cursor falls inside is rebuilt
-        total = len(self._preview_segments)
+        lines = self._active_lines()
+        total = len(lines)
         if max_line is None:
             visible = total
         else:
-            visible = int(np.searchsorted(self._preview_lines, max_line, side="right"))
+            visible = int(np.searchsorted(lines, max_line, side="right"))
         full_chunks = visible // PREVIEW_CHUNK
         for index, items in enumerate(self._preview_chunk_items):
             show = index < full_chunks or visible == total
@@ -757,7 +1049,7 @@ class UnlooperWindow(QMainWindow):
         self._preview_partial_key = partial_key
         if partial_key is not None:
             start = full_chunks * PREVIEW_CHUNK
-            self._preview_partial_items = self._add_path_items(self._preview_segments[start:visible])
+            self._preview_partial_items = self._add_path_items(start, visible, join_next=False)
 
     def _load_code_editor(self):
         code_path = self._output_dir() / f"{self._stem()}_Unlooped_Code.txt"
@@ -832,6 +1124,7 @@ class UnlooperWindow(QMainWindow):
             os.startfile(str(folder))
 
     def closeEvent(self, event):
+        self._save_settings()
         if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
             self.process.kill()
             self.process.waitForFinished(3000)

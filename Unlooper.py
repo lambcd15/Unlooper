@@ -25,6 +25,8 @@ if __name__ == "__main__":
     # import cv2
     import numpy as np
     from matplotlib import pyplot as plt
+    import bisect
+    import json
     import math
     # import datetime
     # import scipy.spatial as spatial
@@ -147,6 +149,21 @@ if __name__ == "__main__":
         # CLI arg 5 overrides this; the GUI always sets it explicitly.
         "render_mode": "precise",
         "Generate_preview_image": False, # Derived from render_mode below
+
+        # Machine dynamics for the acceleration-aware time / real speed estimate (see
+        # plan_motion()). 0 acceleration = off, only the plain distance / feed rate time is given.
+        # CLI args 8 and 9 override these; the GUI always sets them explicitly.
+        "Acceleration_mm_s2": 1000,
+        # Corner model: Marlin 2's junction deviation (its default 0.013 mm). The printer runs in
+        # constant-velocity mode - it only slows for a corner if it can't take it at speed with
+        # this much corner rounding (see plan_motion())
+        "Junction_deviation_mm": 0.013,
+        "Minimum_planner_speed_mm_s": 0.05,  # Marlin's floor, used for full reversals
+        # Pixel coords along the planned motion (speed / acceleration overlay, lag model input).
+        # CLI arg 10 = 1 skips them.
+        "Generate_pixel_coords": True,
+        # G4 dwell: P is milliseconds (G4 P1000 = 1 s), S is seconds
+        "Dwell_P_is_ms": True,
     }
     
     # ************************************ User Variables ******************************************
@@ -174,6 +191,14 @@ if __name__ == "__main__":
         # Optional: render mode - "precise", "preview", "both" or "none"
         if len(sys.argv) >= 7:
             variables["render_mode"] = str(sys.argv[6]).strip().lower()
+        # Optional: acceleration (mm/s^2) and junction deviation (mm) for the acceleration-aware estimate
+        if len(sys.argv) >= 8:
+            variables["Acceleration_mm_s2"] = float(sys.argv[7])
+        if len(sys.argv) >= 9:
+            variables["Junction_deviation_mm"] = float(sys.argv[8])
+        # Optional: 1 = skip the pixel coords
+        if len(sys.argv) >= 10:
+            variables["Generate_pixel_coords"] = str(sys.argv[9]).strip() != "1"
 
     # Resolve the render mode into the two flags the rest of the program uses
     _render_mode = str(variables["render_mode"]).strip().lower()
@@ -182,6 +207,11 @@ if __name__ == "__main__":
     variables["render_mode"] = _render_mode
     variables["Generate_output_image"] = _render_mode in ("precise", "both")
     variables["Generate_preview_image"] = _render_mode in ("preview", "both")
+    # The planned-motion pixel coords replace the old per-command ones from doline() / docircle()
+    variables["Motion_pixel_coords"] = (variables["Acceleration_mm_s2"] > 0 and variables["Generate_pixel_coords"]
+                                        and (variables["Generate_preview_image"] or variables["Generate_output_image"]
+                                             or variables["high_speed"] == False))
+    variables["Motion_pixel_coords_written"] = False
     # ************************************ Functions ******************************************
     # Do not touch
     # Functions for reading in gcode:
@@ -202,6 +232,7 @@ if __name__ == "__main__":
         "Image_name": "",
         "Image": [],
         "Preview_segments": [], # Numeric toolpath geometry plus source line for the fast preview
+        "Dwells": [], # G4 dwells: (segments before, seconds, commands before, line)
         # Array's
         "File_contents": [],
         "File_contents_edited": [], # This can be updated with the latest functions edit
@@ -533,37 +564,26 @@ if __name__ == "__main__":
             # Add the total time and material used
             f.write("; " + "Estimated_Time: " + str(variables["Estimated_Time"]) + "\n")
             f.write("; " + "Total size used x: " + str(variables["X_build"] - 2) + " mm "+ "y: " + str(variables["Y_build"] - 2) + " mm "+ "\n")
+            if variables.get("Estimated_Time_accel"):
+                f.write("; " + "Estimated_Time_accel: " + variables["Estimated_Time_accel"] + " (a=" + str(variables["Acceleration_mm_s2"]) + " mm/s^2, junction deviation=" + str(variables["Junction_deviation_mm"]) + " mm)" + "\n")
             f.write("; " + "Material_Used: " + str(variables["Material_Used"]) + " mg" + "\n" + contents)
         f.close()
 
         variable_names = ["Estimated_Time", "Material_Used"]
-        # Do the same for the input file
+        # Do the same for the input file - always as the first lines of the file, in a fixed
+        # order. Any %@ output lines from a previous run are removed first (wherever they
+        # ended up) so they are replaced rather than duplicated.
         with open(params["Filename"], mode="r+") as f:
             contents = f.readlines()
-        
-        for i in range(len(variable_names)):
-            line_number = 0
-            found  = False
-            for line in contents:
-                if variable_names[i] in line:
-                    # Edit the current line 
-                    found  = True
-                    break
-                line_number = line_number + 1
-            if found  == True:
-                match i:
-                    case 0:
-                        contents[line_number] = ("%@ " + "Estimated_Time: " + str(variables["Estimated_Time"]) + "\n")
-                    case 1:
-                        contents[line_number] = ("%@ " + "Material_Used: " + str(variables["Material_Used"]) + " mg" + "\n")
-            elif found == False:
-                match i:
-                    case 0:
-                        contents.insert(1, "%@ " + "Estimated_Time: " + str(variables["Estimated_Time"]) + "\n")
-                    case 1:
-                        contents.insert(1, "%@ " + "Material_Used: " + str(variables["Material_Used"]) + " mg" + "\n")
-            
-        
+
+        contents = [line for line in contents
+                    if not (line.lstrip().startswith("%@") and any(name in line for name in variable_names))]
+        header = [
+            "%@ " + "Estimated_Time: " + str(variables["Estimated_Time"]) + "\n",
+            "%@ " + "Material_Used: " + str(variables["Material_Used"]) + " mg" + "\n",
+        ]
+        contents = header + contents
+
         with open(params["Filename"], "w") as f:
             contents = "".join(contents)
             f.write(contents)
@@ -941,6 +961,14 @@ if __name__ == "__main__":
         # Units inbound are floats
         # Change the units to 10's of µm
         # Input is in µm which is then converted to mm then to 10's of µm
+
+        # 2025 skip if the line does not contain XYZIJ (ported from Gcode_processing.py) - a
+        # command with no movement still gets one pixel coords entry so the per-command
+        # bookkeeping in line_reader lines up
+        if math.isnan(params["X_increase"]) and math.isnan(params["Y_increase"]) and math.isnan(params["Z_increase"]):
+            params["Pixel_coords_um"].append([variables["Current_X"],variables["Current_Y"],"",0]) # Append a blank line to the pixel coords array
+            return params, variables
+
         # Determine the angle of the line
         params["Angle"] = math.atan2(params["Y2"] - variables["Current_Y"], params["X2"] - variables["Current_X"])
         # Extract the values ***********************************************
@@ -967,7 +995,7 @@ if __name__ == "__main__":
         # To allow the gcode command to be added to pixel cords
         first_go = False
         # 2/10/2023 trying to increase speed using map and high speed
-        if variables["high_speed"] == False:
+        if variables["high_speed"] == False and not variables["Motion_pixel_coords"]:
             for i in range(0, segments + 1):  # Plus one to compensate for start point
                 params["X2"] = variables["Current_X"] + (start_distance + segment_length * i) * math.cos(params["Angle"])
                 params["Y2"] = variables["Current_Y"] + (start_distance + segment_length * i) * math.sin(params["Angle"])
@@ -1019,7 +1047,7 @@ if __name__ == "__main__":
         # To allow the gcode command to be added to pixel cords
         first_go = False
         # 2/10/2023 trying to increase speed using map and high speed
-        if variables["high_speed"] == False:
+        if variables["high_speed"] == False and not variables["Motion_pixel_coords"]:
             for i in range(0, segments + 1):
                 # Calculate the new co-ordinates then plot the line
                 if params["dir"] == 3:
@@ -1092,7 +1120,9 @@ if __name__ == "__main__":
         # Store one move for the vector preview (µm, y already flipped to screen/y-down).
         # Only recorded in the motion-calculation pass - Plot_code re-reads the same lines in a
         # shifted frame, so recording there too would double every segment in "both" mode.
-        if not variables["Generate_preview_image"] or variables["calc_only"] != 1:
+        if variables["calc_only"] != 1:
+            return
+        if not variables["Generate_preview_image"] and variables["Acceleration_mm_s2"] <= 0:
             return
         sweep = 0.0
         if kind in (2, 3):
@@ -1108,7 +1138,9 @@ if __name__ == "__main__":
                 sweep = (a2 - a1) % 360.0
             if kind == 2:
                 sweep = -sweep
-        params["Preview_segments"].append((kind, x1, y1, x2, y2, cx, cy, sweep, params.get("Preview_line_number", 0)))
+        # Last field is the programmed feed (mm/s) for the acceleration planner
+        # ... plus the index of this command in One_coordinate_system (appended right after this)
+        params["Preview_segments"].append((kind, x1, y1, x2, y2, cx, cy, sweep, params.get("Preview_line_number", 0), params["Feed_rate"], len(params["One_coordinate_system"])))
 
     def Plotting_G1_2D(params, variables):
         # This function plots G1 commands as well as calculating the distance reuquired for each command
@@ -1157,7 +1189,10 @@ if __name__ == "__main__":
         params["Centre_1"].append(variables["Current_Y"])
         # If the line only contains Feed rate command (required for Marlin return)
         if "F" in params["Command_array"] and len(params["Command_array"]) == 4:
-            return params, variables 
+            # As in Gcode_processing.py: doline() records the blank pixel coords entry
+            if variables["calc_only"] == 1:
+                params, variables = doline(params, variables)
+            return params, variables
         if variables["calc_only"] == 1:
             # Only calculate the distance if the system is asking for it
             # Keep as high precision units
@@ -1523,6 +1558,8 @@ if __name__ == "__main__":
                     params["Z_increase"] = round(float(params["Command_array"][i+1]) * variables["scale"],2)
                 case "E":
                     params["E_increase"] = round(float(params["Command_array"][i+1]) * variables["scale"],2)
+                case "P":
+                    params["P_value"] = float(params["Command_array"][i+1])
                 case "S":
                     params["S_value"] = round(float(params["Command_array"][i+1]) * variables["scale"],2)
                 case "F":
@@ -1552,6 +1589,7 @@ if __name__ == "__main__":
         params["Z_increase"] = float('NaN')
         params["E_increase"] = float('NaN')
         params["S_value"] = float('NaN')
+        params["P_value"] = float('NaN')
         params["I_increase"] = 0
         params["J_increase"] = 0
         params["Radius"] = 0
@@ -1587,6 +1625,16 @@ if __name__ == "__main__":
                 variables["Origin_X"] = variables["Origin_X_G92"]
                 variables["Origin_Y"] = variables["Origin_Y_G92"]
                 
+            if params["Command_number"] == 4 and variables["calc_only"] == 1:
+                # Dwell - the machine stops here for this long. Recorded as
+                # (segments so far, seconds, commands so far, line) for plan_motion() / generate_pixel_coords()
+                if not math.isnan(params["P_value"]):
+                    dwell_seconds = params["P_value"] / 1000.0 if variables["Dwell_P_is_ms"] else params["P_value"]
+                elif not math.isnan(params["S_value"]):
+                    dwell_seconds = params["S_value"] / variables["scale"]
+                else:
+                    dwell_seconds = 0.0
+                params["Dwells"].append((len(params["Preview_segments"]), dwell_seconds, len(params["One_coordinate_system"]), params.get("Preview_line_number", 0)))
             # Store the current params["Positioning"] system absolute or incremental to be passed to the plotting fucntions
             if params["Command_number"] == 90:
                 params["Positioning"] = "G" + str(int(params["Command_number"]))
@@ -1610,6 +1658,10 @@ if __name__ == "__main__":
                     + " ; " + str(round(params["Centre_1"][0] / variables["scale"],decimal_place)) + " " + str(round(params["Centre_1"][1] * -1 / variables["scale"],decimal_place)) + " " + str(int(params["Command_number"])))
                     params["One_coordinate_system"].append(temp_One_coordinate_system)
                     if variables["high_speed"] == False:
+                        # A command that produced no pixel coords (e.g. a G2/G3 that doesn't move)
+                        # gets a blank entry rather than indexing past the end of the list
+                        if len(params["Pixel_coords_um"]) == temp_length_pixel_coords:
+                            params["Pixel_coords_um"].append([variables["Current_X"], variables["Current_Y"], "", 0])
                         params["Pixel_coords_um"][temp_length_pixel_coords][2] = temp_One_coordinate_system
                         # Used in lag vector to set the length of the computation without having to calculate it
                         params["Pixel_coords_um"][temp_length_pixel_coords][3] = (len(params["Pixel_coords_um"]) - temp_length_pixel_coords)
@@ -1631,6 +1683,10 @@ if __name__ == "__main__":
                     + " ; " + str(round(params["X1"] / variables["scale"],decimal_place)) + " " + str(round(params["Y1"] * -1 / variables["scale"],decimal_place)) + " " + str(round(params["Centre_1"][0] / variables["scale"],decimal_place)) + " " + str(round(params["Centre_1"][1] * -1 / variables["scale"],decimal_place)) + " " + str(round(params["Diff"],decimal_place)) + " " + str(int(params["Command_number"])))
                     params["One_coordinate_system"].append(temp_One_coordinate_system)
                     if variables["high_speed"] == False:
+                        # A command that produced no pixel coords (e.g. a G2/G3 that doesn't move)
+                        # gets a blank entry rather than indexing past the end of the list
+                        if len(params["Pixel_coords_um"]) == temp_length_pixel_coords:
+                            params["Pixel_coords_um"].append([variables["Current_X"], variables["Current_Y"], "", 0])
                         params["Pixel_coords_um"][temp_length_pixel_coords][2] = temp_One_coordinate_system
                         # Used in lag vector to set the length of the computation without having to calculate it
                         params["Pixel_coords_um"][temp_length_pixel_coords][3] = (len(params["Pixel_coords_um"]) - temp_length_pixel_coords)
@@ -1652,6 +1708,10 @@ if __name__ == "__main__":
                     + " ; " + str(round(params["X1"] / variables["scale"],decimal_place)) + " " + str(round(params["Y1"] * -1 / variables["scale"],decimal_place)) + " " + str(round(params["Centre_1"][0] / variables["scale"],decimal_place)) + " " + str(round(params["Centre_1"][1] * -1 / variables["scale"],decimal_place)) + " " + str(round(params["Diff"],decimal_place)) + " " + str(int(params["Command_number"]))) #params["Command_number"]
                     params["One_coordinate_system"].append(temp_One_coordinate_system)
                     if variables["high_speed"] == False:
+                        # A command that produced no pixel coords (e.g. a G2/G3 that doesn't move)
+                        # gets a blank entry rather than indexing past the end of the list
+                        if len(params["Pixel_coords_um"]) == temp_length_pixel_coords:
+                            params["Pixel_coords_um"].append([variables["Current_X"], variables["Current_Y"], "", 0])
                         params["Pixel_coords_um"][temp_length_pixel_coords][2] = temp_One_coordinate_system
                         # Used in lag vector to set the length of the computation without having to calculate it
                         params["Pixel_coords_um"][temp_length_pixel_coords][3] = (len(params["Pixel_coords_um"]) - temp_length_pixel_coords)
@@ -1785,7 +1845,15 @@ if __name__ == "__main__":
                  background=np.array(background, dtype=np.uint8),
                  # Same grid as draw_grid() puts on the PNG: light grey lines every 1 mm (1000 µm)
                  grid_colour=np.array(to_rgb((220, 220, 220)), dtype=np.uint8),
-                 grid_spacing=np.float64(1000.0))
+                 grid_spacing=np.float64(1000.0),
+                 # Reduced pixel coords from generate_pixel_coords(): rows of
+                 # (x µm, y µm, speed mm/s, acceleration mm/s^2, line), plus the critical
+                 # translation speed (mm/s, 0 = unset) and the acceleration setting
+                 samples=params.get("Motion_samples", np.zeros((0, 5), dtype=np.float32)),
+                 cts=np.float64(variables.get("global_return_CTS", 0) / 60.0),
+                 acceleration=np.float64(variables["Acceleration_mm_s2"]),
+                 # Speed range the overlay colour bands were cut from (mm/s)
+                 speed_range=np.asarray(params.get("Motion_speed_range", (0.0, 0.0)), dtype=np.float64))
 
         min_x = float(min(seg_array[:, 1].min(), seg_array[:, 3].min()))
         max_x = float(max(seg_array[:, 1].max(), seg_array[:, 3].max()))
@@ -1824,7 +1892,7 @@ if __name__ == "__main__":
             chunk = segs[start:start + chunk_size]
             paths = {1: [], 2: [], 3: []}
             last_end = {}
-            for kind, x1, y1, x2, y2, cx, cy, sweep, _line in chunk:
+            for kind, x1, y1, x2, y2, cx, cy, sweep, _line, *_ in chunk:
                 d = paths[kind]
                 if last_end.get(kind) != (x1, y1):
                     d.append(f"M{x1:.2f} {y1:.2f}")
@@ -1855,6 +1923,375 @@ if __name__ == "__main__":
             f.write("\n".join(parts))
         print("Preview vector saved:", out_path)
 
+    def format_duration(total_seconds):
+        seconds = round(total_seconds)
+        day = seconds // (24 * 3600)
+        seconds = seconds % (24 * 3600)
+        hour = seconds // 3600
+        seconds %= 3600
+        minutes = seconds // 60
+        seconds %= 60
+        return str(day) + " day " + str(hour) + " hr " + str(minutes) + " min " + str(seconds) + " s"
+
+    def plan_motion(params, variables):
+        # Acceleration-aware estimate of the real machine speed, using the same model as
+        # PrusaSlicer's time estimate for Marlin firmware:
+        #   - every move is a trapezoid: accelerate at a constant rate, cruise, decelerate
+        #   - the speed allowed through a corner comes from Marlin 2's junction deviation: the
+        #     corner is treated as if rounded by an arc that stays within junction_deviation of
+        #     the sharp corner, and the speed is the fastest that arc can be taken at the
+        #     acceleration limit. Straight-on joins keep full speed, gentle bends barely slow,
+        #     tight corners slow more and a full reversal comes (almost) to a stop - so the head
+        #     keeps constant velocity unless a corner can't be taken with minor rounding
+        #   - a backward then forward pass makes sure every move can actually reach / slow to
+        #     its neighbours' speeds within its length
+        # Arcs are additionally capped at the speed where the centripetal acceleration v^2/r
+        # reaches the acceleration limit (sqrt(a*r)).
+        # Returns the total time (s) and stores each planned move as
+        # (segment index, length mm, v_entry, v_peak, v_exit, accel length, decel length) in
+        # params["Planned_moves"] for generate_pixel_coords().
+        accel = float(variables["Acceleration_mm_s2"])
+        deviation = float(variables["Junction_deviation_mm"])
+        min_speed = float(variables["Minimum_planner_speed_mm_s"])
+        scale = variables["scale"]
+        override = variables["Feedrate_override_mm_min"] / 60.0
+        segments = params["Preview_segments"]
+
+        # (segment index, length mm, nominal speed mm/s, entry direction, exit direction)
+        moves = []
+        for index, (kind, x1, y1, x2, y2, cx, cy, sweep, _line, feed, *_) in enumerate(segments):
+            nominal = override if override > 0 else feed
+            if nominal <= 0:
+                continue
+            if kind == 1:
+                length = math.hypot(x2 - x1, y2 - y1) / scale
+                if length <= 0:
+                    continue
+                u = ((x2 - x1) / scale / length, (y2 - y1) / scale / length)
+                u_in = u_out = u
+            else:
+                radius = math.hypot(x1 - cx, y1 - cy) / scale
+                length = radius * math.radians(abs(sweep))
+                if length <= 0:
+                    continue
+                # Point at angle a is (cx + r cos a, cy - r sin a); travel is towards +a when sweep > 0
+                a1 = math.atan2(cy - y1, x1 - cx)
+                a2 = a1 + math.radians(sweep)
+                d = 1.0 if sweep > 0 else -1.0
+                u_in = (-d * math.sin(a1), -d * math.cos(a1))
+                u_out = (-d * math.sin(a2), -d * math.cos(a2))
+                nominal = min(nominal, math.sqrt(accel * radius))
+            moves.append((index, length, nominal, u_in, u_out))
+
+        params["Planned_moves"] = []
+        if not moves:
+            return 0.0
+
+        def junction_speed(prev, curr):
+            # Marlin 2 junction deviation (planner.cpp): theta is the turn between the moves
+            cos_theta = -(prev[4][0] * curr[3][0] + prev[4][1] * curr[3][1])
+            limit = min(prev[2], curr[2])
+            if cos_theta > 0.999999:
+                return min(min_speed, limit)  # full reversal
+            if cos_theta < -0.999999:
+                return limit  # straight on
+            sin_theta_d2 = math.sqrt(0.5 * (1.0 - cos_theta))
+            return min(math.sqrt(accel * deviation * sin_theta_d2 / (1.0 - sin_theta_d2)), limit)
+
+        n = len(moves)
+        # entry[i] = speed at the start of move i, entry[n] = speed at the end of the last move.
+        # The print starts and ends at rest.
+        entry = [0.0] + [junction_speed(moves[i - 1], moves[i]) for i in range(1, n)] + [0.0]
+        # A G4 dwell between two moves brings the machine to a stop
+        dwell_at = sorted(d[0] for d in params.get("Dwells", []) if d[1] > 0)
+        seg_of_move = [m[0] for m in moves]
+        for k in dwell_at:
+            i = bisect.bisect_left(seg_of_move, k)
+            if 0 < i < n:
+                entry[i] = 0.0
+        for i in range(n - 1, -1, -1):
+            entry[i] = min(entry[i], math.sqrt(entry[i + 1] ** 2 + 2 * accel * moves[i][1]))
+        for i in range(n):
+            entry[i + 1] = min(entry[i + 1], math.sqrt(entry[i] ** 2 + 2 * accel * moves[i][1]))
+
+        total_time = 0.0
+        cts = variables.get("global_return_CTS", 0) / 60.0
+        below_cts = 0.0
+        planned = params["Planned_moves"]
+        for i, (index, length, nominal, _u_in, _u_out) in enumerate(moves):
+            v0, v1 = entry[i], entry[i + 1]
+            d_acc = (nominal ** 2 - v0 ** 2) / (2 * accel)
+            d_dec = (nominal ** 2 - v1 ** 2) / (2 * accel)
+            if d_acc + d_dec > length:
+                # Never reaches the programmed feed - accelerate straight into the deceleration
+                peak = max(math.sqrt((2 * accel * length + v0 ** 2 + v1 ** 2) / 2), v0, v1)
+                d_acc = min(max((peak ** 2 - v0 ** 2) / (2 * accel), 0.0), length)
+                d_dec = length - d_acc
+                total_time += (peak - v0) / accel + (peak - v1) / accel
+            else:
+                peak = nominal
+                total_time += (peak - v0) / accel + (peak - v1) / accel + (length - d_acc - d_dec) / peak
+            planned.append((index, length, v0, peak, v1, d_acc, d_dec))
+            if cts > 0:
+                # Speed along the accel phase is sqrt(v0^2 + 2as), so the part below the CTS is exact
+                if peak < cts:
+                    below_cts += length
+                else:
+                    below_cts += min(max((cts ** 2 - v0 ** 2) / (2 * accel), 0.0), d_acc)
+                    below_cts += min(max((cts ** 2 - v1 ** 2) / (2 * accel), 0.0), d_dec)
+        variables["Distance_below_CTS_mm"] = below_cts
+        variables["Dwell_time_s"] = sum(d[1] for d in params.get("Dwells", []))
+        return total_time + variables["Dwell_time_s"]
+
+    def generate_pixel_coords(params, variables):
+        # Pixel coords along the planned (acceleration / junction deviation limited) motion. Like the original
+        # doline() / docircle() pixel coords, a point is placed every scatter_resolution seconds
+        # on one continuous time grid, so the remainder of one command carries into the next -
+        # but the spacing follows the real speed instead of the programmed feed, every point
+        # carries its speed and acceleration, and G4 dwells appear as stationary points.
+        #
+        # At 1 ms this is millions of points (13 M for a 3.7 h print), so it is generated with
+        # numpy in blocks rather than as Python lists:
+        #   - high_speed False: every point is written out for the lag model
+        #       _pixel_cords.csv         - same layout as Gcode_processing.py's pixel coords:
+        #                                  "x, y, 'G-code', count" on the first point of each
+        #                                  command, "x, y" on the rest (µm, y flipped)
+        #       _pixel_coords_motion.csv - the same rows in the same order with the time,
+        #                                  speed, acceleration and line of each point
+        #   - params["Motion_samples"]: the points needed to draw the speed / acceleration
+        #     overlay - any point where the speed colour band or the accel/cruise/decel phase
+        #     changes, the first and last point of every command, and enough points on arcs to
+        #     keep them round. Nothing between those carries extra information for the overlay.
+        planned = params.get("Planned_moves", [])
+        dwells = params.get("Dwells", [])
+        if not planned:
+            params["Motion_samples"] = np.zeros((0, 5), dtype=np.float32)
+            return
+        accel = float(variables["Acceleration_mm_s2"])
+        dt = float(variables["scatter_resolution"])
+        scale = variables["scale"]
+        segments = params["Preview_segments"]
+
+        # --- timeline: planned moves with the dwells slotted in between ------------------
+        plan = np.asarray(planned, dtype=np.float64)
+        seg_index = plan[:, 0].astype(np.int64)
+        length, v0, peak, v1, d_acc, d_dec = (plan[:, k] for k in range(1, 7))
+        t_acc = (peak - v0) / accel
+        t_cruise = np.where(peak > 0, np.maximum(length - d_acc - d_dec, 0.0) / np.maximum(peak, 1e-12), 0.0)
+        t_dec = (peak - v1) / accel
+        geometry = np.asarray([segments[i][:9] for i in seg_index], dtype=np.float64)
+        owner = np.asarray([segments[i][10] for i in seg_index], dtype=np.int64)  # G-code command of each move
+
+        if dwells:
+            dwell = np.asarray(dwells, dtype=np.float64)  # (segments before, seconds, commands before, line)
+            where = np.searchsorted(seg_index, dwell[:, 0], side="left")
+            # A dwell sits at the start of the next move, or the end of the last one
+            nxt = np.minimum(where, len(seg_index) - 1)
+            at_end = where >= len(seg_index)
+            px = np.where(at_end, geometry[nxt, 3], geometry[nxt, 1])
+            py = np.where(at_end, geometry[nxt, 4], geometry[nxt, 2])
+            dwell_geometry = np.column_stack((np.ones(len(dwell)), px, py, px, py, px, py, np.zeros(len(dwell)), dwell[:, 3]))
+            zeros = np.zeros(len(dwell))
+            length, v0, peak, v1, d_acc, d_dec, t_acc, t_dec = (np.insert(a, where, zeros) for a in (length, v0, peak, v1, d_acc, d_dec, t_acc, t_dec))
+            t_cruise = np.insert(t_cruise, where, dwell[:, 1])
+            geometry = np.insert(geometry, where, dwell_geometry, axis=0)
+            # The stationary points belong to the command before the dwell
+            owner = np.insert(owner, where, np.maximum(dwell[:, 2].astype(np.int64) - 1, 0))
+
+        duration = t_acc + t_cruise + t_dec
+        t_end = np.cumsum(duration)
+        t_start = t_end - duration
+        kind, x1, y1, x2, y2, cx, cy, sweep, line = (geometry[:, k] for k in range(9))
+        is_arc = kind != 1
+        seg_len_um = np.maximum(length * scale, 1e-12)
+        ux, uy = np.where(length > 0, (x2 - x1) / seg_len_um, 0.0), np.where(length > 0, (y2 - y1) / seg_len_um, 0.0)
+        radius = np.hypot(x1 - cx, y1 - cy)
+        a_start = np.arctan2(cy - y1, x1 - cx)
+        direction = np.where(sweep > 0, 1.0, -1.0)
+
+        # Points per timeline entry: every multiple of dt inside [t_start, t_end), plus the very
+        # end point. Membership is decided by these counts (not by comparing floats) so the
+        # per-command counts in the lag file always match the rows written.
+        cum_counts = np.ceil(t_end / dt - 1e-9).astype(np.int64)
+        cum_counts[-1] += 1
+        counts = np.diff(np.concatenate(([0], cum_counts)))
+        total_points = int(cum_counts[-1])
+
+        # Colour bands the GUI uses (PrusaSlicer's 11 steps) so a band change is always kept
+        v_min = float(min(v0.min(), v1.min(), peak.min()))
+        v_max = float(peak.max())
+        bands = 11
+        band_width = max(v_max - v_min, 1e-9) / bands
+        params["Motion_speed_range"] = (v_min, v_max)
+        arc_step = math.radians(5.0)  # keep a point every 5 degrees on arcs
+        out_base = "Output/" + params["Filename_only"] + "/" + params["Filename_only"]
+        with open(out_base + "_pixel_coords_legend.json", "w") as f:
+            json.dump({"speed_min_mm_s": v_min, "speed_max_mm_s": v_max, "cts_mm_s": variables.get("global_return_CTS", 0) / 60.0,
+                       "acceleration_mm_s2": accel, "junction_deviation_mm": variables["Junction_deviation_mm"]}, f)
+
+        # PNG images drawn straight from the pixel coords: a line from each point to the next,
+        # coloured by that piece's speed (or acceleration). Same plate, scale (10 µm per pixel)
+        # and grid as the move-type PNG from Plot_code(). Drawn as colour indices first so two
+        # full-size images fit in memory, then coloured when saved.
+        draw_png = variables["Generate_output_image"]
+        if draw_png:
+            height, width = int(variables["Y_build"] * 100), int(variables["X_build"] * 100)
+            speed_index = np.zeros((height, width), dtype=np.uint8)
+            for gx in range(100, width, 100):
+                speed_index[:, gx] = 254
+            for gy in range(100, height, 100):
+                speed_index[gy, :] = 254
+            accel_index = speed_index.copy()
+            # Calc-pass µm -> plot pixels, matching Plot_code()'s origin (1 mm in from the lowest x / y)
+            off_x = (abs(variables["min_x"]) + 1) * scale
+            off_y = (abs(variables["min_y"]) + 1) * scale
+            png_shift = 4  # sub-pixel precision for cv2 (1/16 pixel)
+            line_width = int(variables["Line_width"])
+
+        def draw_runs(index_image, values, px, py):
+            # One polyline per run of equal colour; piece i (point i -> i + 1) has colour values[i]
+            if len(values) == 0:
+                return
+            breaks = np.flatnonzero(values[1:] != values[:-1]) + 1
+            starts = np.concatenate(([0], breaks))
+            ends = np.concatenate((breaks, [len(values)]))
+            pts = np.column_stack((px, py)).astype(np.int32)
+            for a_, b_ in zip(starts.tolist(), ends.tolist()):
+                cv2.polylines(index_image, [pts[a_:b_ + 1]], False, int(values[a_]), line_width, cv2.LINE_8, png_shift)
+
+        write_all = variables["high_speed"] == False
+        commands = params["One_coordinate_system"]
+        if write_all:
+            # Rows per G-code command for the lag file's count column; a command with no points
+            # of its own (feed-only line, move shorter than one time step) gets one repeated point
+            rows_per_command = np.bincount(owner, weights=counts, minlength=len(commands)).astype(np.int64)
+            rows_per_command[rows_per_command == 0] = 1
+            motion_path = "Output/" + params["Filename_only"] + "/" + params["Filename_only"] + "_pixel_coords_motion.csv"
+            motion_file = open(motion_path, "w")
+            motion_file.write("time_s,speed_mm_s,accel_mm_s2,line\n")
+            pixel_file = params["Pixel_File"]
+            last_command = -1
+            last_row = None
+
+        def emit_blank_commands(up_to, xy_row, motion_row, xy_out, motion_out):
+            # Commands between the last one written and up_to with no points of their own
+            nonlocal last_command
+            for c in range(last_command + 1, up_to):
+                xy_out.append(f"{xy_row[0]}, {xy_row[1]}, {commands[c]!r}, 1")
+                motion_out.append(motion_row)
+            last_command = max(last_command, up_to - 1)
+
+        block = 1_000_000
+        kept = []
+        previous = None  # last point of the previous block: (entry, band, phase, arc bucket)
+        for first in range(0, total_points, block):
+            # One extra point past the block so the last point's spacing (speed) is known
+            count = min(first + block, total_points) - first
+            k = np.arange(first, min(first + count + 1, total_points), dtype=np.int64)
+            m = np.searchsorted(cum_counts, k, side="right")
+            tau = np.clip(k * dt - t_start[m], 0.0, duration[m])
+            in_acc = tau < t_acc[m]
+            in_cruise = ~in_acc & (tau < t_acc[m] + t_cruise[m])
+            in_dec = ~in_acc & ~in_cruise
+            tau_dec = np.maximum(tau - t_acc[m] - t_cruise[m], 0.0)
+            dist = np.where(in_acc, v0[m] * tau + 0.5 * accel * tau ** 2,
+                   np.where(in_cruise, d_acc[m] + peak[m] * (tau - t_acc[m]),
+                            length[m] - d_dec[m] + peak[m] * tau_dec - 0.5 * accel * tau_dec ** 2))
+            dist = np.clip(dist, 0.0, length[m])
+            speed = np.where(in_acc, v0[m] + accel * tau, np.where(in_cruise, peak[m], np.maximum(peak[m] - accel * tau_dec, 0.0)))
+            acc = np.where(in_acc, accel, np.where(in_cruise, 0.0, -accel))
+            acc = np.where((in_acc & (t_acc[m] <= 0)) | (in_dec & (t_dec[m] <= 0)), 0.0, acc)
+
+            d_um = dist * scale
+            angle = a_start[m] + direction[m] * d_um / np.maximum(radius[m], 1e-12)
+            arc = is_arc[m]
+            x = np.where(arc, cx[m] + radius[m] * np.cos(angle), x1[m] + ux[m] * d_um)
+            y = np.where(arc, cy[m] - radius[m] * np.sin(angle), y1[m] + uy[m] * d_um)
+
+            # Speed of each point = distance to the next point over the time step, i.e. the
+            # speed of that piece of the path given the pixel coords spacing. The very last
+            # point of the print has no next point and keeps the planned speed (0 at the end).
+            spacing_speed = np.hypot(np.diff(x), np.diff(y)) / scale / dt
+            if len(k) > count:
+                speed = spacing_speed
+            else:
+                speed = np.append(spacing_speed, speed[-1])
+            full_x, full_y = x, y
+            x, y, acc, m, tau, d_um, arc = x[:count], y[:count], acc[:count], m[:count], tau[:count], d_um[:count], arc[:count]
+            k = k[:count]
+            lines = line[m]
+
+            if draw_png:
+                px = (full_x + off_x) / 10.0 * (1 << png_shift)
+                py = (full_y + off_y) / 10.0 * (1 << png_shift)
+                draw_runs(speed_index, np.minimum(((speed - v_min) / band_width).astype(np.int64), bands - 1) + 1, px, py)
+                draw_runs(accel_index, np.sign(acc).astype(np.int64) + 2, px, py)
+
+            if write_all:
+                t = t_start[m] + tau
+                xy_out, motion_out = [], []
+                xs, ys = np.round(x, 3).tolist(), np.round(y, 3).tolist()
+                ts, vs, acs, ls = t.tolist(), speed.tolist(), acc.tolist(), lines.astype(np.int64).tolist()
+                cmd = owner[m].tolist()
+                for i in range(len(xs)):
+                    motion_row = f"{ts[i]:.4f},{vs[i]:.5f},{acs[i]:.1f},{ls[i]}"
+                    c = cmd[i]
+                    if c != last_command:
+                        emit_blank_commands(c, last_row[0] if last_row else (xs[i], ys[i]), last_row[1] if last_row else motion_row, xy_out, motion_out)
+                        xy_out.append(f"{xs[i]}, {ys[i]}, {commands[c]!r}, {rows_per_command[c]}")
+                        last_command = c
+                    else:
+                        xy_out.append(f"{xs[i]}, {ys[i]}")
+                    motion_out.append(motion_row)
+                    last_row = ((xs[i], ys[i]), motion_row)
+                if first + len(k) == total_points:
+                    emit_blank_commands(len(commands), last_row[0], last_row[1], xy_out, motion_out)
+                pixel_file.write("\n".join(xy_out) + "\n")
+                motion_file.write("\n".join(motion_out) + "\n")
+
+            # Keep only the points where something visible changes
+            band = np.minimum(((speed - v_min) / band_width).astype(np.int64), bands - 1)
+            phase = np.sign(acc).astype(np.int64)
+            bucket = np.where(arc, np.floor(d_um / np.maximum(radius[m], 1e-12) / arc_step), -1).astype(np.int64)
+            keys = (m, band, phase, bucket)
+            change = np.zeros(len(k), dtype=bool)
+            for key in keys:
+                change[1:] |= key[1:] != key[:-1]
+            change[0] = previous is None or any(int(key[0]) != p for key, p in zip(keys, previous))
+            move_change = np.zeros(len(k), dtype=bool)
+            move_change[1:] = m[1:] != m[:-1]
+            keep = change.copy()
+            keep[:-1] |= move_change[1:]  # also the last point of each command, to hold the corner
+            keep[-1] = keep[-1] or first + len(k) == total_points
+            kept.append(np.column_stack((x, y, speed, acc, lines))[keep].astype(np.float32))
+            previous = tuple(int(key[-1]) for key in keys)
+            print("Pixel coords progress:", str(int(100 * (first + len(k)) / total_points)) + "%")
+
+        if draw_png:
+            # Colour the index images and save: 0 background, 254 grid, 1..11 speed bands,
+            # 1..3 decelerating / constant / accelerating (all BGR for cv2)
+            speed_colours = [(11, 44, 122), (19, 89, 133), (28, 136, 145), (4, 214, 15), (170, 242, 0), (252, 249, 3),
+                             (245, 206, 10), (227, 136, 32), (209, 104, 48), (194, 82, 60), (148, 38, 22)]
+            accel_colours = [(19, 89, 133), (150, 150, 150), (209, 104, 48)]
+            for index_image, colours, suffix in ((speed_index, speed_colours, "_pixel_coords_speed.png"),
+                                                 (accel_index, accel_colours, "_pixel_coords_accel.png")):
+                palette = np.zeros((256, 3), dtype=np.uint8)
+                palette[:] = variables["Background_colour"]
+                palette[254] = (220, 220, 220)
+                for i, (r_, g_, b_) in enumerate(colours):
+                    palette[i + 1] = (b_, g_, r_)
+                cv2.imwrite(out_base + suffix, palette[index_image])
+                print("Pixel coords image saved:", out_base + suffix)
+            del speed_index, accel_index
+
+        if write_all:
+            motion_file.close()
+            variables["Motion_pixel_coords_written"] = True
+            print("Pixel coords saved (lag format):", total_points, "points,", "Output/" + params["Filename_only"] + "/" + params["Filename_only"] + "_pixel_cords.csv")
+            print("Pixel coords motion data saved:", motion_path)
+        params["Motion_samples"] = np.concatenate(kept) if kept else np.zeros((0, 5), dtype=np.float32)
+        print("Pixel coords (accel/junction):", total_points, "points every", round(dt * 1000, 3), "ms,", len(params["Motion_samples"]), "kept for the speed overlay")
+
     def motion_calculations(params, variables):
         # Variables for the new start location
         variables["Current_X"] = 0
@@ -1876,7 +2313,14 @@ if __name__ == "__main__":
         params["G2_G3_Edited_output"] = []
         # line_num = 0
         variables["calc_only"] = 1
+        total_lines = max(len(params["Unlooped_contents"]), 1)
+        last_percent = -1
         for preview_line_number, line in enumerate(params["Unlooped_contents"]):
+            # Progress for the GUI (and console), once per whole percent
+            percent = int(100 * (preview_line_number + 1) / total_lines)
+            if percent != last_percent:
+                print("Scaffold outputs progress:", str(percent) + "%")
+                last_percent = percent
             # Loop through all the lines in the edited contents array
             params["Line"] = line
             params["Preview_line_number"] = preview_line_number
@@ -1940,6 +2384,19 @@ if __name__ == "__main__":
         seconds %= 60
         # Display the time to console
         print("Total Time:", day, "day", hour, "hr", minutes, "min", seconds, "s")
+        variables["Estimated_Time_accel"] = ""
+        if variables["Acceleration_mm_s2"] > 0:
+            print("Planning motion (acceleration", variables["Acceleration_mm_s2"], "mm/s^2, junction deviation", variables["Junction_deviation_mm"], "mm)...")
+            accel_seconds = plan_motion(params, variables)
+            variables["Estimated_Time_accel"] = format_duration(accel_seconds)
+            print("Total Time (accel/junction):", variables["Estimated_Time_accel"])
+            if variables["Dwell_time_s"] > 0:
+                print("Dwell time (G4, included above):", round(variables["Dwell_time_s"], 3), "s")
+            if accel_seconds > 0:
+                print("Average speed (accel/junction):", round(total_distance_mm / accel_seconds * 60, 2), "mm/min")
+            if variables["global_return_CTS"] > 0:
+                below = variables["Distance_below_CTS_mm"]
+                print("Path below CTS:", round(below / 1000, 3), "m", "(" + str(round(100 * below / max(total_distance_mm, 1e-9), 2)) + "%)")
         # Correction factor for the material due to differences in weight of the fibre and the actual volume of material used in the print. 
         correction_factor = 1.0 #? 1.25
         # Volume in cm^3
@@ -1968,8 +2425,14 @@ if __name__ == "__main__":
         else:
             variables["Y_build"] = math.ceil(abs(variables["min_y"]) + abs(variables["max_y"])) + 2  # mm
         print("Total size used x:", (variables["X_build"] - 2), "y:", (variables["Y_build"] - 2))
+        # Pixel coords (needs the plate size above for the PNGs)
+        if variables["Acceleration_mm_s2"] > 0:
+            if variables["Motion_pixel_coords"]:
+                generate_pixel_coords(params, variables)
+            elif not variables["Generate_pixel_coords"]:
+                print("Pixel coords skipped")
         # Save the pixel coordinates to a file
-        if variables["high_speed"] == False : 
+        if variables["high_speed"] == False and not variables["Motion_pixel_coords_written"]:
             for i in range(len(params["Pixel_coords_um"])):
                 params["Pixel_File"].write("%s\n" % str(params["Pixel_coords_um"][i])[1:-1])
                 # f.write(f"{pixel_cords[i]}\n")

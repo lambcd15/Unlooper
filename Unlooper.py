@@ -3,12 +3,13 @@
     python Unlooper.py <file> <unloop_only 0|1> [feedrate mm/min] [density g/cm3] [fibre diameter um]
                        [render precise|preview|both|none] [acceleration mm/s2] [junction deviation mm]
                        [skip pixel coords 1|0] [jerk mm/s] [lag prediction 1|0] [CTS mm/min]
-                       [write lag-format files 1|0]
+                       [write lag-format files 1|0] [lag compensation none|overshoot|slowdown|iterative]
+                       [rapid mm/min] [overshoot scale] [slow-down ratio of CTS] [iterations]
 
 This file holds the settings, the command line and the order the stages run in; the
 stages themselves live in unlooper_core/ (see unlooper_core/__init__.py):
     gcode_reader -> toolpath -> motion_planner -> pixel_coords -> corner_path -> lag_model
-                                (run together by scaffold_outputs)   -> rendering
+                                (run together by scaffold_outputs)   -> rendering -> lag_compensation
 """
 import os
 import sys
@@ -140,6 +141,15 @@ if __name__ == "__main__":
         # Critical translation speed (mm/min) for the lag model and the "below CTS" figure.
         # 0 = use the file's CriticalTranslationSpeed parameter
         "CTS_override_mm_min": 0,
+        # Lag compensation (lag_compensation.py): "none", "overshoot" (ISBF corner overshoot
+        # and swing), "slowdown" (slow before corners) or "iterative" (model-driven path
+        # correction). Writes <name>_Lag_compensated.txt and processes it too.
+        "Lag_compensation": "none",
+        "Lag_comp_rapid_mm_min": 3000,  # overshoot: speed of the swing round the corner
+        "Lag_comp_overshoot_scale": 1.0,  # overshoot: multiple of the model's lag at the corner
+        "Lag_comp_slow_ratio": 1.0,  # slowdown: corner speed as a multiple of the CTS
+        "Lag_comp_tolerance_mm": 0.05,  # slowdown: jet lag to reach before the corner
+        "Lag_comp_iterations": 6,  # iterative: correction passes
     }
     
     # ************************************ User Variables ******************************************
@@ -187,7 +197,21 @@ if __name__ == "__main__":
         # Optional: 1 = write the lag-format pixel coords files (pixel coords, corner path, lag)
         if len(sys.argv) >= 14:
             variables["high_speed"] = str(sys.argv[13]).strip() != "1"
+        # Optional: lag compensation method and its settings
+        if len(sys.argv) >= 15:
+            variables["Lag_compensation"] = str(sys.argv[14]).strip().lower()
+        if len(sys.argv) >= 16:
+            variables["Lag_comp_rapid_mm_min"] = float(sys.argv[15])
+        if len(sys.argv) >= 17:
+            variables["Lag_comp_overshoot_scale"] = float(sys.argv[16])
+        if len(sys.argv) >= 18:
+            variables["Lag_comp_slow_ratio"] = float(sys.argv[17])
+        if len(sys.argv) >= 19:
+            variables["Lag_comp_iterations"] = int(float(sys.argv[18]))
 
+    # Compensation works from the lag model's predictions
+    if variables["Lag_compensation"] != "none":
+        variables["Lag_prediction"] = True
     # Resolve the render mode into the two flags the rest of the program uses
     _render_mode = str(variables["render_mode"]).strip().lower()
     if _render_mode not in ("precise", "preview", "both", "none"):
@@ -340,6 +364,12 @@ if __name__ == "__main__":
         if variables["Generate_preview_image"] == True:
             render_preview_svg(params, variables)
         save_outputs(params,variables)
+        if variables["Lag_compensation"] != "none":
+            from unlooper_core.lag_compensation import compensate, run_compensated
+            print("************** Lag compensation **************")
+            compensated_path = compensate(params, variables)
+            if compensated_path:
+                run_compensated(compensated_path, params, variables, os.path.abspath(__file__))
         
         # Print the time taken to this point
         previous = time.time()

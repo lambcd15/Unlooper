@@ -25,11 +25,13 @@ What changed from python_lag.py (the maths per step is the same):
 """
 import json
 import math
+import os
 from pathlib import Path
 
 import numpy as np
 
 from .palette import SPEED_BANDS, SPEED_COLOURS, GRID_INDEX, NOZZLE_INDEX, band_of, band_edges, save_indexed_png
+from .path_reference import DeviationTracker
 from .pixel_coords import draw_runs, output_base, to_png_pixels
 
 try:
@@ -40,6 +42,10 @@ except ImportError:  # pragma: no cover - numba is optional, just slower without
 CALIBRATION = Path(__file__).resolve().parent.parent / "lag_data" / "Lag_1.2b_fM.csv"
 DEFAULT_CTS_MM_MIN = 230.0  # python_lag.py's default jet speed when none is given
 LAG_LEVELS = 250  # fine lag levels while drawing; mapped to the colour bands at the end
+# The path the jet is scored against. A lag-compensated run is scored against the
+# original file's path (saved by lag_compensation.py and passed in this variable), not
+# against its own compensated nozzle path.
+REFERENCE_ENV = "UNLOOPER_REFERENCE_SEGMENTS"
 
 
 def objective(x, a, b):
@@ -106,8 +112,9 @@ lag_steps = njit(cache=True, nogil=True)(_lag_steps) if njit is not None else _l
 
 class JetLagModel:
     # Consumer for generate_corner_path(): runs the model on each block of pixel coords,
-    # draws the jet path, keeps the points the GUI needs and writes _lag.csv when the
-    # lag-format files are on.
+    # draws the jet path, keeps the points the GUI needs, writes _lag.csv when the
+    # lag-format files are on, records the lag at the end of every command (for the lag
+    # compensation) and measures how far the jet lands from the programmed path.
 
     def __init__(self, params, variables):
         self.params, self.variables = params, variables
@@ -129,6 +136,10 @@ class JetLagModel:
             self.csv = open(self.out_base + "_lag.csv", "w")
             self.csv.write("X,Y,Lag\n")
         self.image = params.get("Lag_index_image")
+        self.lag_at_command_end = np.full(len(params["One_coordinate_system"]), np.nan)
+        reference = os.environ.get(REFERENCE_ENV)
+        segments = np.load(reference) if reference and os.path.exists(reference) else params["Preview_segments"]
+        self.deviation = DeviationTracker(np.asarray(segments, dtype=np.float64).tolist())
         print("Lag prediction: CTS", self.js, "mm/min, lag curve y = %.5f * (x ^ %.5f) - %.5f" % (self.a, self.b, self.a))
 
     def _start(self, b):
@@ -180,6 +191,11 @@ class JetLagModel:
 
         level = np.clip(np.nan_to_num(lag / self.level_scale * LAG_LEVELS, nan=0.0).astype(np.int64), 0, LAG_LEVELS - 1) + 1
         cx_um, cy_um = cx * self.scale, cy * self.scale
+        # Lag at the last point of each command (the corner it ends in)
+        owner = tl.owner[b.m]
+        ends = np.flatnonzero(np.append(owner[1:] != owner[:-1], True))
+        self.lag_at_command_end[owner[ends]] = lag[ends]
+        self.deviation.add(cx_um, cy_um)
         if self.image is not None:
             px, py = to_png_pixels(self.variables, cx_um, cy_um)
             if b.first > 0:
@@ -214,6 +230,18 @@ class JetLagModel:
             return
         lag_min, lag_max = self.lag_min, self.lag_max
         print("Jet lag: mean", round(self.lag_sum / self.points, 4), "mm, range", round(lag_min, 4), "-", round(lag_max, 4), "mm")
+        deviation = self.deviation.summary()
+        if deviation is not None:
+            print("Jet deviation from programmed path: mean", round(deviation[0], 2), "um, 95%", round(deviation[1], 1),
+                  "um, max", round(deviation[2], 1), "um")
+        # Commands with no points of their own take the lag of the command before
+        lag_end = self.lag_at_command_end
+        valid = np.isfinite(lag_end)
+        if valid.any():
+            filled = np.maximum.accumulate(np.where(valid, np.arange(len(lag_end)), -1))
+            lag_end = np.where(filled >= 0, lag_end[np.maximum(filled, 0)], 0.0)
+        params["Lag_at_command_end"] = np.nan_to_num(lag_end)
+        params["Lag_model"] = (self.js, self.dt, self.a, self.b, self.eps)
         params["Lag_samples"] = np.concatenate(self.kept) if self.kept else np.zeros((0, 4), dtype=np.float32)
         params["Lag_range"] = (lag_min, lag_max)
         with open(self.out_base + "_lag_legend.json", "w") as f:

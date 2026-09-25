@@ -144,6 +144,7 @@ def generate_corner_path(params, variables, consumers=()):
     corner_planned, move_time, _below = plan_moves(segments, dwells, variables)
     params["Corner_segments"] = segments
     params["Corner_planned_moves"] = corner_planned
+    params["Corner_dwells"] = dwells
     if not corner_planned:
         return
     dwell_time = sum(d[1] for d in dwells)

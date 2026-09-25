@@ -58,3 +58,14 @@ def save_indexed_png(path, index_image, colours, background=BACKGROUND):
     image = Image.fromarray(index_image, mode="P")
     image.putpalette(palette.ravel().tolist())
     image.save(path, compress_level=1)
+
+
+def ramp(low_rgb, high_rgb, count=SPEED_BANDS):
+    # `count` colours from low_rgb to high_rgb
+    low, high = np.asarray(low_rgb, dtype=np.float64), np.asarray(high_rgb, dtype=np.float64)
+    return [tuple(int(round(c)) for c in low + (high - low) * t) for t in np.linspace(0.0, 1.0, count)]
+
+
+# Two-hue lag comparison: original jet in blues, compensated jet in reds (light = small lag)
+BLUE_RAMP = ramp((158, 202, 225), (8, 48, 107))
+RED_RAMP = ramp((252, 174, 145), (103, 0, 13))

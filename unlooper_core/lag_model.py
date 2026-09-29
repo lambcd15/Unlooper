@@ -244,6 +244,9 @@ class JetLagModel:
         params["Lag_model"] = (self.js, self.dt, self.a, self.b, self.eps)
         params["Lag_samples"] = np.concatenate(self.kept) if self.kept else np.zeros((0, 4), dtype=np.float32)
         params["Lag_range"] = (lag_min, lag_max)
+        if os.environ.get(REFERENCE_ENV):
+            # A lag-compensated run: leave the jet points for the parent's before / after image
+            np.save(self.out_base + "_jet_samples.npy", params["Lag_samples"])
         with open(self.out_base + "_lag_legend.json", "w") as f:
             json.dump({"lag_min_mm": lag_min, "lag_max_mm": lag_max, "lag_bands": SPEED_BANDS,
                        "lag_band_edges_mm": band_edges(lag_min, lag_max), "cts_mm_min": self.js,

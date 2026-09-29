@@ -45,8 +45,9 @@ This program can also be run from the command line (or through the GUI, `python 
 python Unlooper.py "filename" <unloop_only 0|1> [feedrate mm/min] [density] [fibre diameter um]
                    [render precise|preview|both|none] [acceleration mm/s2] [junction deviation mm]
                    [skip pixel coords 1|0] [jerk mm/s] [lag prediction 1|0] [CTS mm/min]
-                   [write lag-format files 1|0] [lag compensation none|overshoot|slowdown|iterative]
+                   [write lag-format files 1|0] [lag compensation none|overshoot|pointwise|slowdown|iterative|hybrid]
                    [rapid mm/min] [overshoot scale] [slow-down ratio of CTS] [iterations]
+                   [pointwise point spacing um, 0 = adaptive] [hybrid corner tolerance um]
 ```
 Only the first two arguments are required; 0 for an override means "use the file's own value".
 
@@ -63,7 +64,9 @@ stages are in `unlooper_core/`:
 | `pixel_coords.py` | nozzle positions every 1 ms along the planned motion; speed / acceleration PNGs |
 | `corner_path.py` | the same with corners rounded as the machine runs them (constant-velocity mode) |
 | `lag_model.py` | jet lag prediction (Ievgenii's python_lag model, compiled with numba) along the corner path |
-| `lag_compensation.py` | writes `_Lag_compensated.txt` (ISBF overshoot arcs, corner slow-down, or iterative model-driven correction) and runs it |
+| `lag_compensation.py` | writes `_Lag_compensated.txt` (ISBF overshoot arcs, point-by-point ISBF, corner slow-down, iterative model-driven correction or hybrid), runs it and draws the before / after image |
+| `hybrid.py` | the hybrid lag compensation: the nozzle leads the jet along the path by the lag (the lag model run backwards), sheds lag before sharp corners, fitted to the planner and the simulated jet; G1 moves only |
+| `isbf.py` | the ISBF lag compensation (Gcode_processing.py `vector_angle`), ported so it writes the same G-code |
 | `path_reference.py` | the programmed path as a polyline; how far the jet lands from it |
 | `scaffold_outputs.py` | runs the stages above and totals the results |
 | `rendering.py` | move-type PNG and vector (SVG) preview |
@@ -73,8 +76,10 @@ Outputs in `Output/<name>/` besides the unlooped code and images: `_pixel_cords.
 `_corner_pixel_cords.csv` (same layout, for the lag model) and their `_motion.csv` companions,
 `_lag.csv` (jet contact point X, Y and lag in mm), `_lag.png` and the `_legend.json` files.
 The lag calibration data is `lag_data/Lag_1.2b_fM.csv`. A lag-compensated run's outputs go
-to `Output/<name>_Lag_compensated/`; the GUI's jet lag view can show the nozzle and jet paths
-of both runs as separate layers.
+to `Output/<name>_Lag_compensated/`, and `Output/<name>/<name>_lag_compensation.png` shows the
+programmed path in black, the jet before compensation in grey and after it in green (the ISBF
+code's colours). The GUI's jet lag view can show the nozzle and jet paths of both runs as
+separate layers, coloured by lag or ("Colour: lag compensation") in those same colours.
 
 ## Setup
 

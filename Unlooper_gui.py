@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QCheckBox, QFileDialog, QProgressBar, QPlainTextEdit,
     QGroupBox, QSplitter, QDoubleSpinBox, QListWidget, QGraphicsView,
-    QGraphicsScene, QComboBox, QGraphicsPathItem,
+    QGraphicsScene, QComboBox, QGraphicsPathItem, QScrollArea, QFrame, QSizePolicy,
 )
 from PySide6.QtSvgWidgets import QGraphicsSvgItem
 
@@ -51,9 +51,17 @@ ACCEL_COLOURS = {-1: (ACCEL_RGB[0], "Decelerating"), 0: (ACCEL_RGB[1], "Constant
 DIMMED = (225, 225, 225)  # everything outside the highlighted band
 NOZZLE_UNDERLAY = (200, 200, 200)  # nozzle path under the jet path in the lag view
 COMP_NOZZLE_UNDERLAY = (120, 120, 120)  # compensated nozzle path
+# "Lag compensation" view: the ISBF code's colours - programmed path black, jet before
+# compensation grey, jet after compensation green (as <name>_lag_compensation.png)
+ISBF_PROGRAMMED = (0, 0, 0)
+ISBF_JET_BEFORE = (150, 150, 150)
+ISBF_JET_AFTER = (25, 130, 25)
+ISBF_COMP_NOZZLE = (240, 190, 140)  # the compensated nozzle path, if shown, kept apart from the jets
 # Lag compensation methods: (label, value sent to Unlooper.py)
 COMPENSATION_METHODS = [("None", "none"), ("Overshoot arcs (ISBF)", "overshoot"),
-                        ("Corner slow-down (speed)", "slowdown"), ("Iterative (model-driven)", "iterative")]
+                        ("Point-by-point ISBF (pixel coords)", "pointwise"),
+                        ("Corner slow-down (speed)", "slowdown"), ("Iterative (model-driven)", "iterative"),
+                        ("Hybrid: lead by the lag, G1 only", "hybrid")]
 JET_DEVIATION_RE = re.compile(r"^Jet deviation from programmed path:\s*(.+)")
 COMP_PREFIX = "Compensated: "
 
@@ -311,7 +319,6 @@ class UnlooperWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Unlooper")
-        self.resize(1200, 800)
 
         self.input_files = []
         self._active_file = None
@@ -328,6 +335,29 @@ class UnlooperWindow(QMainWindow):
         self._build_ui()
         self._load_settings()
         self._update_run_enabled()
+        self._fit_to_screen()
+
+    def _fit_to_screen(self):
+        # Restore the last window size/position, else 1200 x 800; either way keep it within
+        # the screen's available area (minus the taskbar) so it fits on smaller displays
+        settings = QSettings("Unlooper", "Unlooper")
+        geometry = settings.value("window_geometry")
+        restored = geometry is not None and self.restoreGeometry(geometry)
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            if not restored:
+                self.resize(1200, 800)
+            return
+        avail = screen.availableGeometry()
+        width = min(self.width() if restored else 1200, avail.width())
+        height = min(self.height() if restored else 800, avail.height())
+        self.resize(width, height)
+        frame = self.frameGeometry()
+        if not restored or not avail.contains(frame):
+            frame.moveCenter(avail.center())
+            frame.moveLeft(max(frame.left(), avail.left()))
+            frame.moveTop(max(frame.top(), avail.top()))
+            self.move(frame.topLeft())
 
     # ── UI construction ──────────────────────────────────────────────────
 
@@ -348,6 +378,8 @@ class UnlooperWindow(QMainWindow):
         self.clear_files_btn.clicked.connect(self._clear_files)
         top.addWidget(self.clear_files_btn)
         self.file_label = QLabel("No files selected")
+        # Long file lists are clipped rather than forcing the window wider
+        self.file_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         top.addWidget(self.file_label, stretch=1)
         root.addLayout(top)
 
@@ -518,12 +550,20 @@ class UnlooperWindow(QMainWindow):
         self.comp_method_combo.setToolTip(
             "Writes <name>_Lag_compensated.txt and runs it too, so its jet path can be shown over\n"
             "the original ('Colour: jet lag', compensated layers). Turns lag prediction on.\n"
-            "  Overshoot arcs (ISBF): carry on past each corner by the lag the model predicts there,\n"
-            "    swing round the corner at the rapid speed, rejoin the next move a lag along it.\n"
+            "  Overshoot arcs (ISBF): the original vector_angle - carry on past each corner by\n"
+            "    0.85 x the lag (from the jet model on the compensated path, one command ahead),\n"
+            "    swing round the corner at the rapid speed and rejoin the next line that far along\n"
+            "    it; arcs use the fitted reset distances. Then correction passes per corner.\n"
+            "  Point-by-point ISBF: the same, but every line is cut into points (spacing below) and\n"
+            "    the lag is found and compensated after each point, so it works for any command length.\n"
             "  Corner slow-down: slow to a ratio of the CTS before each corner for as long as the\n"
             "    model says the jet needs to catch up. Same path, only the speeds change.\n"
             "  Iterative: correct the nozzle path pass by pass with the planner and lag model in\n"
-            "    the loop until the simulated jet lands on the programmed path."
+            "    the loop until the simulated jet lands on the programmed path.\n"
+            "  Hybrid: the nozzle leads the jet along the path by exactly the lag, so the jet follows\n"
+            "    lines and curves; before a sharp corner the lag is shed (slowing towards the CTS) so\n"
+            "    the nozzle's jump round it stays within the corner tolerance. Fitted to the planner\n"
+            "    and the simulated jet. G1 moves only (for controllers without G2 / G3)."
         )
         comp_grid.addWidget(self.comp_method_combo, 0, 1)
         comp_grid.addWidget(QLabel("Rapid speed (mm/min):"), 1, 0)
@@ -531,14 +571,15 @@ class UnlooperWindow(QMainWindow):
         self.comp_rapid_spin.setRange(1, 1_000_000)
         self.comp_rapid_spin.setDecimals(0)
         self.comp_rapid_spin.setSingleStep(100)
-        self.comp_rapid_spin.setToolTip("Overshoot arcs: speed of the swing round each corner (ISBF used 3000).")
+        self.comp_rapid_spin.setToolTip("Overshoot arcs / point-by-point: speed of the swing round each corner (ISBF used 3000).")
         comp_grid.addWidget(self.comp_rapid_spin, 1, 1)
         comp_grid.addWidget(QLabel("Overshoot scale:"), 2, 0)
         self.comp_scale_spin = QDoubleSpinBox()
         self.comp_scale_spin.setRange(0, 5)
         self.comp_scale_spin.setDecimals(2)
         self.comp_scale_spin.setSingleStep(0.05)
-        self.comp_scale_spin.setToolTip("Overshoot arcs: overshoot = this x the lag the model predicts at the corner\n(ISBF used a fixed 0.85 x one lag length).")
+        self.comp_scale_spin.setToolTip("Overshoot arcs / point-by-point: overshoot = this x the lag at the corner\n"
+                                        "(ISBF's Lag_length_reduction_factor: 0.85 for speed ratios 1.3 - 1.5, 1.0 at max speed).")
         comp_grid.addWidget(self.comp_scale_spin, 2, 1)
         comp_grid.addWidget(QLabel("Slow-down (x CTS):"), 3, 0)
         self.comp_slow_spin = QDoubleSpinBox()
@@ -549,10 +590,36 @@ class UnlooperWindow(QMainWindow):
         comp_grid.addWidget(self.comp_slow_spin, 3, 1)
         comp_grid.addWidget(QLabel("Iterations:"), 4, 0)
         self.comp_iter_spin = QDoubleSpinBox()
-        self.comp_iter_spin.setRange(1, 100)
+        self.comp_iter_spin.setRange(0, 100)
         self.comp_iter_spin.setDecimals(0)
-        self.comp_iter_spin.setToolTip("Iterative: number of correction passes (each plans and simulates the whole print).")
+        self.comp_iter_spin.setToolTip(
+            "Correction passes, each planning and simulating the whole print.\n"
+            "Overshoot / point-by-point: each corner's overshoot is moved by how far the jet still\n"
+            "cuts or loops past it; a pass is only kept if the jet lands closer. 0 = the ISBF output as is.\n"
+            "Iterative: passes of the nozzle path correction.\n"
+            "Hybrid: passes fitting the planned lag to the one the simulated jet ran with.")
         comp_grid.addWidget(self.comp_iter_spin, 4, 1)
+        comp_grid.addWidget(QLabel("Point spacing (µm):"), 5, 0)
+        self.comp_spacing_spin = QDoubleSpinBox()
+        self.comp_spacing_spin.setRange(0, 10_000)
+        self.comp_spacing_spin.setDecimals(1)
+        self.comp_spacing_spin.setSingleStep(5)
+        self.comp_spacing_spin.setSpecialValueText("Adaptive")
+        self.comp_spacing_spin.setToolTip("Point-by-point: lines are cut into points this far apart and the lag is\n"
+                                          "compensated after each one.\n"
+                                          "0 = Adaptive: points one nozzle sample apart at each end of a line, wider in\n"
+                                          "the middle, with each corner's overshoot solved on the lag model at the\n"
+                                          "planner's speeds.")
+        comp_grid.addWidget(self.comp_spacing_spin, 5, 1)
+        comp_grid.addWidget(QLabel("Corner tolerance (µm):"), 6, 0)
+        self.comp_corner_spin = QDoubleSpinBox()
+        self.comp_corner_spin.setRange(1, 5000)
+        self.comp_corner_spin.setDecimals(0)
+        self.comp_corner_spin.setSingleStep(5)
+        self.comp_corner_spin.setToolTip("Hybrid: how far the nozzle may jump round a sharp corner. The lag is shed\n"
+                                         "before each corner until the jump is this small, so smaller = the jet turns\n"
+                                         "the corner more exactly, and the print is slower where corners are close.")
+        comp_grid.addWidget(self.comp_corner_spin, 6, 1)
         self.comp_method_combo.currentIndexChanged.connect(self._update_option_states)
         left_layout.addWidget(comp_group)
 
@@ -614,6 +681,14 @@ class UnlooperWindow(QMainWindow):
 
         left_layout.addStretch()
 
+        # The options panel is taller than many laptop screens, so it scrolls rather than
+        # setting a minimum window height
+        left_scroll = QScrollArea()
+        left_scroll.setWidget(left)
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        left_scroll.setMinimumWidth(200)
+
         # Right: editable code + vector preview + console log
         right_splitter = QSplitter(Qt.Orientation.Vertical)
 
@@ -624,7 +699,7 @@ class UnlooperWindow(QMainWindow):
         self.preview_view.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.preview_view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.preview_view.setBackgroundBrush(Qt.GlobalColor.black)
-        self.preview_view.setMinimumHeight(260)
+        self.preview_view.setMinimumHeight(100)
         preview_layout.addWidget(self.preview_view)
         preview_row = QHBoxLayout()
         self.hide_after_cursor_check = QCheckBox("Hide toolpath after cursor")
@@ -638,11 +713,14 @@ class UnlooperWindow(QMainWindow):
         self.colour_mode_combo.addItem("Colour: actual speed", "speed")
         self.colour_mode_combo.addItem("Colour: acceleration", "accel")
         self.colour_mode_combo.addItem("Colour: jet lag", "lag")
+        self.colour_mode_combo.addItem("Colour: lag compensation (black / grey / green)", "isbf")
         self.colour_mode_combo.setToolTip(
             "Speed and acceleration come from the pixel coords along the planned motion,\n"
             "which need Acceleration > 0 on the run (see Overrides).\n"
             "Jet lag shows where the jet lands (coloured by lag) over the nozzle path in grey;\n"
             "it needs 'Lag prediction' on the run.\n"
+            "Lag compensation uses the ISBF code's colours: programmed path black, jet before\n"
+            "compensation grey, jet after compensation green (needs a lag compensation run).\n"
             "Click a colour in the legend to highlight that band."
         )
         self.colour_mode_combo.currentIndexChanged.connect(self._rebuild_preview_items)
@@ -718,10 +796,10 @@ class UnlooperWindow(QMainWindow):
         right_splitter.setStretchFactor(1, 3)
         right_splitter.setStretchFactor(2, 2)
 
-        splitter.addWidget(left)
+        splitter.addWidget(left_scroll)
         splitter.addWidget(right_splitter)
         splitter.setChildrenCollapsible(False)
-        splitter.setSizes([360, 840])
+        splitter.setSizes([left.sizeHint().width() + left_scroll.verticalScrollBar().sizeHint().width(), 840])
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         root.addWidget(splitter, stretch=1)
@@ -732,6 +810,7 @@ class UnlooperWindow(QMainWindow):
         root.addWidget(self.progress_bar)
 
         self.status_label = QLabel("Ready")
+        self.status_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         root.addWidget(self.status_label)
 
     # ── File selection ───────────────────────────────────────────────────
@@ -782,9 +861,11 @@ class UnlooperWindow(QMainWindow):
         self.write_files_check.setChecked(settings.value("write_lag_files", "false") in (True, "true"))
         self.comp_method_combo.setCurrentIndex(max(0, self.comp_method_combo.findData(settings.value("lag_compensation", "none"))))
         self.comp_rapid_spin.setValue(float(settings.value("comp_rapid", 3000.0)))
-        self.comp_scale_spin.setValue(float(settings.value("comp_overshoot_scale", 1.0)))
+        self.comp_scale_spin.setValue(float(settings.value("comp_isbf_factor", 0.85)))
         self.comp_slow_spin.setValue(float(settings.value("comp_slow_ratio", 1.0)))
         self.comp_iter_spin.setValue(float(settings.value("comp_iterations", 6)))
+        self.comp_spacing_spin.setValue(float(settings.value("comp_point_spacing", 0.0)))
+        self.comp_corner_spin.setValue(float(settings.value("comp_corner_um", 20.0)))
         self._update_option_states()
         self.render_mode_combo.setCurrentIndex(max(0, self.render_mode_combo.findData(settings.value("render_mode", "preview"))))
         self.motion_only_check.setChecked(settings.value("motion_only", "false") in (True, "true"))
@@ -804,13 +885,16 @@ class UnlooperWindow(QMainWindow):
         settings.setValue("write_lag_files", self.write_files_check.isChecked())
         settings.setValue("lag_compensation", self.comp_method_combo.currentData())
         settings.setValue("comp_rapid", self.comp_rapid_spin.value())
-        settings.setValue("comp_overshoot_scale", self.comp_scale_spin.value())
+        settings.setValue("comp_isbf_factor", self.comp_scale_spin.value())
         settings.setValue("comp_slow_ratio", self.comp_slow_spin.value())
         settings.setValue("comp_iterations", self.comp_iter_spin.value())
+        settings.setValue("comp_point_spacing", self.comp_spacing_spin.value())
+        settings.setValue("comp_corner_um", self.comp_corner_spin.value())
         settings.setValue("render_mode", self.render_mode_combo.currentData())
         settings.setValue("motion_only", self.motion_only_check.isChecked())
         settings.setValue("skip_pixel_coords", self.skip_pixel_check.isChecked())
         settings.setValue("colour_mode", self.colour_mode_combo.currentData())
+        settings.setValue("window_geometry", self.saveGeometry())
 
     def _update_option_states(self):
         unloop_only = self.unloop_only_check.isChecked()
@@ -821,10 +905,13 @@ class UnlooperWindow(QMainWindow):
         self.write_files_check.setEnabled(not unloop_only)
         method = self.comp_method_combo.currentData()
         self.comp_method_combo.setEnabled(not unloop_only)
-        self.comp_rapid_spin.setEnabled(method == "overshoot")
-        self.comp_scale_spin.setEnabled(method == "overshoot")
+        isbf = method in ("overshoot", "pointwise")
+        self.comp_rapid_spin.setEnabled(isbf or method == "hybrid")
+        self.comp_scale_spin.setEnabled(isbf)
         self.comp_slow_spin.setEnabled(method == "slowdown")
-        self.comp_iter_spin.setEnabled(method == "iterative")
+        self.comp_iter_spin.setEnabled(isbf or method in ("iterative", "hybrid"))
+        self.comp_spacing_spin.setEnabled(method == "pointwise")
+        self.comp_corner_spin.setEnabled(method == "hybrid")
 
     def _update_run_enabled(self):
         running = self.process is not None and self.process.state() != QProcess.ProcessState.NotRunning
@@ -923,9 +1010,11 @@ class UnlooperWindow(QMainWindow):
         lag = "1" if self.lag_check.isChecked() else "0"
         cts = str(self.cts_spin.value())
         write_files = "1" if self.write_files_check.isChecked() else "0"
-        # ... <lag compensation> <rapid mm/min> <overshoot scale> <slow-down ratio> <iterations>
+        # ... <lag compensation> <rapid mm/min> <overshoot scale> <slow-down ratio> <iterations> <point spacing um>
+        # <corner tolerance um>
         compensation = [self.comp_method_combo.currentData(), str(self.comp_rapid_spin.value()),
-                        str(self.comp_scale_spin.value()), str(self.comp_slow_spin.value()), str(int(self.comp_iter_spin.value()))]
+                        str(self.comp_scale_spin.value()), str(self.comp_slow_spin.value()), str(int(self.comp_iter_spin.value())),
+                        str(self.comp_spacing_spin.value()), str(self.comp_corner_spin.value())]
         self.process.setArguments([str(UNLOOPER_SCRIPT), self._active_file, unloop_only, feedrate, density, fibre_diameter,
                                    render_mode, accel, junction, skip_pixel, jerk, lag, cts, write_files] + compensation)
         self.process.readyReadStandardOutput.connect(self._on_output)
@@ -1171,32 +1260,40 @@ class UnlooperWindow(QMainWindow):
     def _layer_on(self, key):
         return self.layer_checks[key].isChecked()
 
+    def _isbf_colours(self):
+        return self.colour_mode_combo.currentData() == "isbf"
+
     def _two_hue(self):
         # Both jet layers on the graph: blues for the original, reds for the compensated
+        # (grey and green in the lag compensation view)
         return (self._layer_on("jet") and self._lag_samples is not None
                 and self._layer_on("comp_jet") and self._comp is not None)
 
     def _primary_lag(self):
         # The jet layer drawn through the chunk system (and hidden after the editor cursor):
-        # the file's own jet if it's on, otherwise the compensated jet
-        if self._layer_on("jet") and self._lag_samples is not None:
-            return self._lag_samples, self._lag_range, "original"
-        if self._layer_on("comp_jet") and self._comp is not None:
-            return self._comp["lag_samples"], self._comp["lag_range"], "compensated"
+        # the file's own jet if it's on, otherwise the compensated jet. The lag compensation
+        # view puts the compensated jet on top, as the ISBF code drew it.
+        own = (self._lag_samples, self._lag_range, "original") if self._layer_on("jet") and self._lag_samples is not None else None
+        comp = ((self._comp["lag_samples"], self._comp["lag_range"], "compensated")
+                if self._layer_on("comp_jet") and self._comp is not None else None)
+        order = (comp, own) if self._isbf_colours() else (own, comp)
+        for choice in order:
+            if choice is not None:
+                return choice
         return None, (0.0, 0.0), None
 
     def _sample_mode(self):
         # Speed / acceleration colouring draws the pixel coords instead of the G-code moves,
         # jet lag colouring draws the jet contact points
         mode = self.colour_mode_combo.currentData()
-        if mode == "lag":
+        if mode in ("lag", "isbf"):
             return self._lag_samples is not None or self._comp is not None
         return mode in ("speed", "accel") and self._preview_samples is not None
 
     def _active_lines(self):
         if not self._sample_mode():
             return self._preview_lines
-        if self.colour_mode_combo.currentData() == "lag":
+        if self.colour_mode_combo.currentData() in ("lag", "isbf"):
             samples = self._primary_lag()[0]
             return samples[:, 3] if samples is not None else np.zeros(0)
         return self._preview_sample_lines
@@ -1206,6 +1303,8 @@ class UnlooperWindow(QMainWindow):
         return {b: QColor(*(c if highlight in (None, b) else DIMMED)) for b, c in enumerate(colours)}
 
     def _lag_palette(self, which):
+        if self._isbf_colours():
+            return [ISBF_JET_BEFORE if which == "original" else ISBF_JET_AFTER] * len(SPEED_COLOURS)
         if not self._two_hue():
             return SPEED_COLOURS
         return BLUE_RAMP if which == "original" else RED_RAMP
@@ -1215,10 +1314,10 @@ class UnlooperWindow(QMainWindow):
         # is the original's
         scene = self.preview_view.scene()
         underlays = []
-        if self._layer_on("nozzle"):
-            underlays.append((self._preview_segments, NOZZLE_UNDERLAY))
         if self._layer_on("comp_nozzle") and self._comp is not None:
-            underlays.append((self._comp["segments"], COMP_NOZZLE_UNDERLAY))
+            underlays.append((self._comp["segments"], ISBF_COMP_NOZZLE if self._isbf_colours() else COMP_NOZZLE_UNDERLAY))
+        if self._layer_on("nozzle"):
+            underlays.append((self._preview_segments, ISBF_PROGRAMMED if self._isbf_colours() else NOZZLE_UNDERLAY))
         for segments, colour in underlays:
             for path in build_toolpath_paths(segments).values():
                 item = QGraphicsPathItem(path)
@@ -1226,11 +1325,14 @@ class UnlooperWindow(QMainWindow):
                 scene.addItem(item)
                 self._underlay_items.append(item)
         if self._two_hue():
-            v_min, v_max = self._comp["lag_range"]
-            bins = len(RED_RAMP)
+            # The other jet, under the chunked one
+            samples, (v_min, v_max), which = ((self._lag_samples, self._lag_range, "original") if self._isbf_colours()
+                                              else (self._comp["lag_samples"], self._comp["lag_range"], "compensated"))
+            palette = self._lag_palette(which)
+            bins = len(palette)
             width = max(v_max - v_min, 1e-9) / bins
-            paths = build_sample_paths(self._comp["lag_samples"], lambda v, a: min(bins - 1, max(0, int((v - v_min) / width))))
-            colours = self._band_colours(RED_RAMP, self._comp_highlight)
+            paths = build_sample_paths(samples, lambda v, a: min(bins - 1, max(0, int((v - v_min) / width))))
+            colours = self._band_colours(palette, None if self._isbf_colours() else self._comp_highlight)
             for key, path in paths.items():
                 item = QGraphicsPathItem(path)
                 item.setPen(QPen(colours[key], 0))
@@ -1238,7 +1340,7 @@ class UnlooperWindow(QMainWindow):
                 self._underlay_items.append(item)
 
     def _build_all_chunks(self):
-        if self.colour_mode_combo.currentData() == "lag" and self._sample_mode():
+        if self.colour_mode_combo.currentData() in ("lag", "isbf") and self._sample_mode():
             self._add_static_lag_layers()
         total = len(self._active_lines())
         for start in range(0, total, PREVIEW_CHUNK):
@@ -1248,7 +1350,7 @@ class UnlooperWindow(QMainWindow):
         scene = self.preview_view.scene()
         if self._sample_mode():
             mode = self.colour_mode_combo.currentData()
-            if mode == "lag":
+            if mode in ("lag", "isbf"):
                 source, (v_min, v_max), which = self._primary_lag()
                 if source is None:
                     return []
@@ -1257,7 +1359,7 @@ class UnlooperWindow(QMainWindow):
                 source, (v_min, v_max), palette = self._preview_samples, self._preview_speed_range, SPEED_COLOURS
             # Include the next chunk's first point so consecutive chunks join up
             samples = source[start:stop + 1 if join_next else stop]
-            if mode in ("speed", "lag"):
+            if mode in ("speed", "lag", "isbf"):
                 bins = len(palette)
                 width = max(v_max - v_min, 1e-9) / bins
                 paths = build_sample_paths(samples, lambda v, a: min(bins - 1, max(0, int((v - v_min) / width))))
@@ -1278,12 +1380,25 @@ class UnlooperWindow(QMainWindow):
 
     def _update_legend(self):
         mode = self.colour_mode_combo.currentData()
-        self.layer_widget.setVisible(mode == "lag")
+        self.layer_widget.setVisible(mode in ("lag", "isbf"))
         self.comp_legend.setVisible(False)
         if mode == "kind":
             self.speed_legend.setVisible(False)
             return
         self.speed_legend.setVisible(True)
+        if mode == "isbf":
+            if self._raster_loaded:
+                self.speed_legend.set_entries([(ISBF_PROGRAMMED, "Programmed path"), (ISBF_JET_BEFORE, "Jet before"),
+                                               (ISBF_JET_AFTER, "Jet after compensation")])
+            elif self._lag_samples is None and self._comp is None:
+                self.speed_legend.set_message("No jet data - run with a lag compensation method")
+            else:
+                entries = [(ISBF_PROGRAMMED, "Programmed path (nozzle)"), (ISBF_JET_BEFORE, "Jet before"),
+                           (ISBF_JET_AFTER, "Jet after compensation")]
+                if self._layer_on("comp_nozzle") and self._comp is not None:
+                    entries.append((ISBF_COMP_NOZZLE, "Compensated nozzle"))
+                self.speed_legend.set_entries(entries)
+            return
         bands = len(SPEED_COLOURS)
         if mode == "lag":
             if self._raster_loaded:
@@ -1382,7 +1497,12 @@ class UnlooperWindow(QMainWindow):
         # band can be highlighted by changing the palette.
         mode = self.colour_mode_combo.currentData()
         suffix = {"speed": "_pixel_coords_speed.png", "accel": "_pixel_coords_accel.png"}.get(mode, "_cv2_Image_output.png")
-        image_path = self._raster_lag_choice()[0] if mode == "lag" else self._output_dir() / f"{self._stem()}{suffix}"
+        if mode == "lag":
+            image_path = self._raster_lag_choice()[0]
+        elif mode == "isbf":
+            image_path = self._output_dir() / f"{self._stem()}_lag_compensation.png"
+        else:
+            image_path = self._output_dir() / f"{self._stem()}{suffix}"
         if not image_path.exists():
             image_path = self._output_dir() / f"{self._stem()}_cv2_Image_output.png"
         if not image_path.exists():

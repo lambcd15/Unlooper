@@ -3,8 +3,9 @@
     python Unlooper.py <file> <unloop_only 0|1> [feedrate mm/min] [density g/cm3] [fibre diameter um]
                        [render precise|preview|both|none] [acceleration mm/s2] [junction deviation mm]
                        [skip pixel coords 1|0] [jerk mm/s] [lag prediction 1|0] [CTS mm/min]
-                       [write lag-format files 1|0] [lag compensation none|overshoot|slowdown|iterative]
+                       [write lag-format files 1|0] [lag compensation none|overshoot|pointwise|slowdown|iterative|hybrid]
                        [rapid mm/min] [overshoot scale] [slow-down ratio of CTS] [iterations]
+                       [pointwise point spacing um, 0 = adaptive] [hybrid corner tolerance um]
 
 This file holds the settings, the command line and the order the stages run in; the
 stages themselves live in unlooper_core/ (see unlooper_core/__init__.py):
@@ -142,14 +143,17 @@ if __name__ == "__main__":
         # 0 = use the file's CriticalTranslationSpeed parameter
         "CTS_override_mm_min": 0,
         # Lag compensation (lag_compensation.py): "none", "overshoot" (ISBF corner overshoot
-        # and swing), "slowdown" (slow before corners) or "iterative" (model-driven path
-        # correction). Writes <name>_Lag_compensated.txt and processes it too.
+        # and swing), "pointwise" (the nozzle leads the jet by the lag at every point),
+        # "slowdown" (slow before corners) or "iterative" (model-driven path correction).
+        # Writes <name>_Lag_compensated.txt and processes it too.
         "Lag_compensation": "none",
-        "Lag_comp_rapid_mm_min": 3000,  # overshoot: speed of the swing round the corner
-        "Lag_comp_overshoot_scale": 1.0,  # overshoot: multiple of the model's lag at the corner
+        "Lag_comp_rapid_mm_min": 3000,  # overshoot / pointwise: speed of the swing round a corner
+        "Lag_comp_overshoot_scale": 0.85,  # overshoot / pointwise: overshoot = lag x this (ISBF used 0.85)
         "Lag_comp_slow_ratio": 1.0,  # slowdown: corner speed as a multiple of the CTS
         "Lag_comp_tolerance_mm": 0.05,  # slowdown: jet lag to reach before the corner
-        "Lag_comp_iterations": 6,  # iterative: correction passes
+        "Lag_comp_iterations": 6,  # overshoot / pointwise / iterative: correction passes (0 = none)
+        "Lag_comp_point_spacing_um": 0.0,  # pointwise: distance between the points compensated (0 = adaptive)
+        "Lag_comp_corner_um": 20.0,  # hybrid: how far the nozzle may jump round a sharp corner (smaller = closer, slower)
     }
     
     # ************************************ User Variables ******************************************
@@ -208,6 +212,10 @@ if __name__ == "__main__":
             variables["Lag_comp_slow_ratio"] = float(sys.argv[17])
         if len(sys.argv) >= 19:
             variables["Lag_comp_iterations"] = int(float(sys.argv[18]))
+        if len(sys.argv) >= 20:
+            variables["Lag_comp_point_spacing_um"] = float(sys.argv[19])
+        if len(sys.argv) >= 21:
+            variables["Lag_comp_corner_um"] = float(sys.argv[20])
 
     # Compensation works from the lag model's predictions
     if variables["Lag_compensation"] != "none":

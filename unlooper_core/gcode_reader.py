@@ -300,8 +300,8 @@ def scan_for_subprogram(params):
                 program_number = line[line.find("P") + 1 : line.find("L")]
                 isInt = True
                 try:
-                    # converting to integer
-                    int(program_number)
+                    # converting to integer (a whole number written with a decimal point, e.g. L30.0, is fine)
+                    isInt = float(program_number) == int(float(program_number))
                 except ValueError:
                     isInt = False
                 if isInt:
@@ -314,8 +314,8 @@ def scan_for_subprogram(params):
                 loop_number = line[line.find("L") + 1 : len(line)]
                 isInt = True
                 try:
-                    # converting to integer
-                    int(loop_number)
+                    # converting to integer (a whole number written with a decimal point, e.g. L30.0, is fine)
+                    isInt = float(loop_number) == int(float(loop_number))
                 except ValueError:
                     isInt = False
                 if isInt:

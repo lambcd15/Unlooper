@@ -137,7 +137,7 @@ def render_preview_svg(params, variables):
              speed_range=np.asarray(params.get("Motion_speed_range", (0.0, 0.0)), dtype=np.float64),
              # Jet contact points from the lag model: rows of (x µm, y µm, lag mm, line),
              # and the lag range its colour bands are cut from (mm)
-             lag_samples=params.get("Lag_samples", np.zeros((0, 4), dtype=np.float32)),
+             lag_samples=params.get("Lag_samples", np.zeros((0, 5), dtype=np.float32)),
              lag_range=np.asarray(params.get("Lag_range", (0.0, 0.0)), dtype=np.float64))
 
     min_x = float(min(seg_array[:, 1].min(), seg_array[:, 3].min()))

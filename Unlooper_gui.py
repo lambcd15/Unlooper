@@ -61,8 +61,13 @@ ISBF_COMP_NOZZLE = (240, 190, 140)  # the compensated nozzle path, if shown, kep
 COMPENSATION_METHODS = [("None", "none"), ("Overshoot arcs (ISBF)", "overshoot"),
                         ("Point-by-point ISBF (pixel coords)", "pointwise"),
                         ("Corner slow-down (speed)", "slowdown"), ("Iterative (model-driven)", "iterative"),
-                        ("Hybrid: lead by the lag, G1 only", "hybrid")]
+                        ("Hybrid: lead by the lag, G1 only", "hybrid"),
+                        ("Hybrid: constant jet speed (fibre diameter), G1 only", "hybrid_constant")]
 JET_DEVIATION_RE = re.compile(r"^Jet deviation from programmed path:\s*(.+)")
+FIBRE_RE = re.compile(r"^Fibre diameter .*?within \+(?:/-)?([\d.]+)% for ([\d.]+)% of the print; thickest x([\d.]+)")
+# Fibre diameter view: d / d0 bands around the tolerance t - much thinner, thinner, within
+# +/- t, thicker, much thicker, far thicker (edges 1-2t, 1-t, 1+t, 1+2t, 1+4t)
+DIAMETER_COLOURS = [(40, 90, 200), (120, 170, 230), (60, 150, 70), (240, 200, 60), (240, 130, 40), (200, 40, 40)]
 COMP_PREFIX = "Compensated: "
 
 # Defaults for the GUI settings (remembered between sessions with QSettings)
@@ -73,6 +78,67 @@ DEFAULT_JERK = 5.0  # mm/s
 # Number of toolpath segments per scene item. Big enough to keep the item count low on
 # large files, small enough that rebuilding the chunk under the cursor is instant.
 PREVIEW_CHUNK = 2000
+
+# Output PNGs can be hundreds of megapixels (fine pixel sizes on a big plate), so they are
+# shrunk once on load to at most this many pixels a side and cached by path + mtime.
+# Unlooper writes them itself, so PIL's decompression-bomb limit is lifted.
+RASTER_PREVIEW_MAX = 1600
+GRID_INDEX = 254  # palette index of the grid lines in the speed / accel / lag PNGs
+Image.MAX_IMAGE_PIXELS = None
+_raster_cache = {}
+
+
+def read_raster_preview(path):
+    # Returns ("P", index image, palette) for a palette PNG or ("RGB", image, None),
+    # downscaled so the longest side is <= RASTER_PREVIEW_MAX
+    key = str(path)
+    mtime = os.path.getmtime(path)
+    cached = _raster_cache.get(key)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    with Image.open(path) as pil_image:
+        width, height = pil_image.size
+        factor = max(1, math.ceil(max(width, height) / RASTER_PREVIEW_MAX))
+        if pil_image.mode == "P":
+            palette = np.asarray(pil_image.getpalette()[:768], dtype=np.uint8).reshape(-1, 3)
+            result = ("P", shrink_index_image(np.asarray(pil_image), factor), palette)
+        else:
+            result = None
+    if result is None:
+        # cv2 decodes big PNGs about twice as fast as PIL, and can drop to 1/2, 1/4 or 1/8 as it reads
+        reduced = {2: cv2.IMREAD_REDUCED_COLOR_2, 4: cv2.IMREAD_REDUCED_COLOR_4, 8: cv2.IMREAD_REDUCED_COLOR_8}
+        step = max([s for s in reduced if s <= factor], default=1)
+        image = cv2.imread(str(path), reduced[step] if step > 1 else cv2.IMREAD_UNCHANGED)
+        if image is None:
+            raise OSError(f"Could not read {path}")
+        if image.ndim == 3 and image.shape[2] == 4:
+            image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
+        elif image.ndim == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        scale = RASTER_PREVIEW_MAX / max(image.shape[:2])
+        if scale < 1.0:
+            image = cv2.resize(image, (max(1, int(image.shape[1] * scale)), max(1, int(image.shape[0] * scale))),
+                               interpolation=cv2.INTER_AREA)
+        result = ("RGB", image, None)
+    if len(_raster_cache) >= 8:
+        _raster_cache.pop(next(iter(_raster_cache)))
+    _raster_cache[key] = (mtime, result)
+    return result
+
+
+def shrink_index_image(indices, factor):
+    # Shrink a palette PNG by factor x factor blocks without losing thin lines: a block
+    # takes its highest colour band, else grid if it has any, else background (index 0)
+    if factor <= 1:
+        return np.ascontiguousarray(indices)
+    height, width = indices.shape
+    pad_h, pad_w = -height % factor, -width % factor
+    if pad_h or pad_w:
+        indices = np.pad(indices, ((0, pad_h), (0, pad_w)))
+    shape = (indices.shape[0] // factor, factor, indices.shape[1] // factor, factor)
+    bands = np.where(indices == GRID_INDEX, 0, indices).reshape(shape).max(axis=(1, 3))
+    grid = (indices == GRID_INDEX).reshape(shape).any(axis=(1, 3))
+    return np.where(bands > 0, bands, np.where(grid, GRID_INDEX, 0)).astype(np.uint8)
 
 
 def build_toolpath_paths(segments):
@@ -563,7 +629,10 @@ class UnlooperWindow(QMainWindow):
             "  Hybrid: the nozzle leads the jet along the path by exactly the lag, so the jet follows\n"
             "    lines and curves; before a sharp corner the lag is shed (slowing towards the CTS) so\n"
             "    the nozzle's jump round it stays within the corner tolerance. Fitted to the planner\n"
-            "    and the simulated jet. G1 moves only (for controllers without G2 / G3)."
+            "    and the simulated jet. G1 moves only (for controllers without G2 / G3).\n"
+            "  Hybrid, constant jet speed: the same lead, but the jet never slows, so the lag and the\n"
+            "    fibre diameter stay constant (as ISBF). Where the path turns tighter than the jet can\n"
+            "    at that speed (about 0.8 mm radius at speed ratio 3), it is rounded off instead."
         )
         comp_grid.addWidget(self.comp_method_combo, 0, 1)
         comp_grid.addWidget(QLabel("Rapid speed (mm/min):"), 1, 0)
@@ -620,6 +689,72 @@ class UnlooperWindow(QMainWindow):
                                          "before each corner until the jump is this small, so smaller = the jet turns\n"
                                          "the corner more exactly, and the print is slower where corners are close.")
         comp_grid.addWidget(self.comp_corner_spin, 6, 1)
+        comp_grid.addWidget(QLabel("Fibre diameter tolerance (%):"), 7, 0)
+        self.diam_tol_spin = QDoubleSpinBox()
+        self.diam_tol_spin.setRange(0.5, 100)
+        self.diam_tol_spin.setDecimals(1)
+        self.diam_tol_spin.setSingleStep(1)
+        self.diam_tol_spin.setToolTip("How much the fibre diameter may change, estimated from the jet speed:\n"
+                                      "d / d0 = sqrt(v0 / v), v0 the programmed speed. Used by the fibre diameter\n"
+                                      "view and, if ticked below, as the hybrid's limit.")
+        self.diam_tol_spin.valueChanged.connect(self._on_diameter_tolerance_changed)
+        comp_grid.addWidget(self.diam_tol_spin, 7, 1)
+        self.diam_hold_check = QCheckBox("Hybrid holds the fibre within it")
+        self.diam_hold_check.setToolTip("Hybrid: plan the jet so the fibre stays within the tolerance (the jet slows\n"
+                                        "at most 1 - 1/(1+t)^2: 5% -> 9.3%). Several ways of turning the corners are\n"
+                                        "tried - the ISBF paper's arc, rounding the path, constant speed, the program\n"
+                                        "unchanged - each simulated, and the most accurate one that keeps the fibre\n"
+                                        "within the tolerance is written. Unticked: the jet slows as far as each\n"
+                                        "sharp corner needs (closest to the path, fibre up to ~2x at those corners).")
+        comp_grid.addWidget(self.diam_hold_check, 8, 0, 1, 2)
+        self.time_keep_check = QCheckBox("ISBF / point-by-point: time-preserving feeds")
+        self.time_keep_check.setToolTip("Overshoot arcs / point-by-point: speed each command's moves up (never down) so\n"
+                                        "they take the time the command was programmed to take, and solve the path again\n"
+                                        "at those feeds. The compensated nozzle path is longer than the path it draws, so\n"
+                                        "at the programmed feed the print takes longer, the jet runs slower and the fibre\n"
+                                        "comes out thicker. This trades some accuracy for a fibre nearer its diameter;\n"
+                                        "it helps most on curves with a fast machine, and can hurt on dense corners.")
+        comp_grid.addWidget(self.time_keep_check, 12, 0, 1, 2)
+        comp_grid.addWidget(QLabel("Swing blend (µm):"), 13, 0)
+        self.blend_spin = QDoubleSpinBox()
+        self.blend_spin.setRange(-1, 5000)
+        self.blend_spin.setDecimals(0)
+        self.blend_spin.setSingleStep(10)
+        self.blend_spin.setSpecialValueText("Auto")
+        self.blend_spin.setToolTip("ISBF / point-by-point smooth swings: the sharp kinks where an overshoot line meets\n"
+                                   "its swing arc, and the arc the next line, are each replaced by one fillet arc of this\n"
+                                   "radius. The machine has to brake for a sharp kink; through the fillet the nozzle keeps\n"
+                                   "the programmed speed, which keeps the fibre at its diameter.\n"
+                                   "Auto: point-by-point uses the smallest radius the machine can take at the feed\n"
+                                   "(v² / (0.85 × acceleration), about 120 µm at 612 mm/min and 1000 mm/s²); the ISBF\n"
+                                   "method is left as the original code wrote it. 0 = off.")
+        comp_grid.addWidget(self.blend_spin, 13, 1)
+        comp_grid.addWidget(QLabel("Mandrel diameter (mm):"), 9, 0)
+        self.mandrel_spin = QDoubleSpinBox()
+        self.mandrel_spin.setRange(0, 1000)
+        self.mandrel_spin.setDecimals(3)
+        self.mandrel_spin.setSingleStep(0.5)
+        self.mandrel_spin.setSpecialValueText("Flat")
+        self.mandrel_spin.setToolTip("Tubular printing: the mandrel's diameter. A (degrees) is then read as the\n"
+                                     "distance round the tube, F as the surface speed; the compensated file is\n"
+                                     "written with A, and <name>_mandrel.png draws the path on the tube.")
+        comp_grid.addWidget(self.mandrel_spin, 9, 1)
+        export_row = QHBoxLayout()
+        self.comment_combo = QComboBox()
+        for label, value in (("% comments", "%"), ("; comments", ";"), ("No comments", "")):
+            self.comment_combo.addItem(label, value)
+        self.comment_combo.setToolTip("Comment style of the exported G-code (Mach3 / MEW files use %)")
+        export_row.addWidget(self.comment_combo)
+        self.export_btn = QPushButton("Export compensated G-code…")
+        self.export_btn.setToolTip("Save the lag-compensated file of the last run, ready to print")
+        self.export_btn.clicked.connect(self._export_compensated)
+        export_row.addWidget(self.export_btn)
+        comp_grid.addLayout(export_row, 10, 0, 1, 2)
+        self.mandrel_view_btn = QPushButton("Open mandrel 3D view")
+        self.mandrel_view_btn.setToolTip("The last run's <name>_mandrel.png: the path on the mandrel in 3D\n"
+                                         "(set a mandrel diameter; for a Z-shaped mandrel it is the radius at Z = 0)")
+        self.mandrel_view_btn.clicked.connect(self._open_mandrel_view)
+        comp_grid.addWidget(self.mandrel_view_btn, 11, 0, 1, 2)
         self.comp_method_combo.currentIndexChanged.connect(self._update_option_states)
         left_layout.addWidget(comp_group)
 
@@ -663,8 +798,10 @@ class UnlooperWindow(QMainWindow):
             ("avg_speed", "Avg. actual speed"),
             ("below_cts", "Path below CTS"),
             ("jet_dev", "Jet off path (mean, 95%)"),
+            ("fibre", "Fibre within tolerance"),
             ("comp_time", "Compensated est. time"),
             ("comp_dev", "Compensated jet off path"),
+            ("comp_fibre", "Compensated fibre within tol."),
         ]):
             cap = QLabel(caption + ":")
             val = QLabel("—")
@@ -714,6 +851,7 @@ class UnlooperWindow(QMainWindow):
         self.colour_mode_combo.addItem("Colour: acceleration", "accel")
         self.colour_mode_combo.addItem("Colour: jet lag", "lag")
         self.colour_mode_combo.addItem("Colour: lag compensation (black / grey / green)", "isbf")
+        self.colour_mode_combo.addItem("Colour: fibre diameter (from jet speed)", "diam")
         self.colour_mode_combo.setToolTip(
             "Speed and acceleration come from the pixel coords along the planned motion,\n"
             "which need Acceleration > 0 on the run (see Overrides).\n"
@@ -866,6 +1004,12 @@ class UnlooperWindow(QMainWindow):
         self.comp_iter_spin.setValue(float(settings.value("comp_iterations", 6)))
         self.comp_spacing_spin.setValue(float(settings.value("comp_point_spacing", 0.0)))
         self.comp_corner_spin.setValue(float(settings.value("comp_corner_um", 20.0)))
+        self.diam_tol_spin.setValue(float(settings.value("diameter_tolerance", 5.0)))
+        self.diam_hold_check.setChecked(str(settings.value("diameter_hold", "true")).lower() == "true")
+        self.time_keep_check.setChecked(str(settings.value("time_preserving", "false")).lower() == "true")
+        self.blend_spin.setValue(float(settings.value("swing_blend_um", -1.0)))
+        self.comment_combo.setCurrentIndex(max(0, self.comment_combo.findData(settings.value("export_comments", "%"))))
+        self.mandrel_spin.setValue(float(settings.value("mandrel_diameter", 0.0)))
         self._update_option_states()
         self.render_mode_combo.setCurrentIndex(max(0, self.render_mode_combo.findData(settings.value("render_mode", "preview"))))
         self.motion_only_check.setChecked(settings.value("motion_only", "false") in (True, "true"))
@@ -890,6 +1034,12 @@ class UnlooperWindow(QMainWindow):
         settings.setValue("comp_iterations", self.comp_iter_spin.value())
         settings.setValue("comp_point_spacing", self.comp_spacing_spin.value())
         settings.setValue("comp_corner_um", self.comp_corner_spin.value())
+        settings.setValue("diameter_tolerance", self.diam_tol_spin.value())
+        settings.setValue("diameter_hold", self.diam_hold_check.isChecked())
+        settings.setValue("time_preserving", self.time_keep_check.isChecked())
+        settings.setValue("swing_blend_um", self.blend_spin.value())
+        settings.setValue("export_comments", self.comment_combo.currentData())
+        settings.setValue("mandrel_diameter", self.mandrel_spin.value())
         settings.setValue("render_mode", self.render_mode_combo.currentData())
         settings.setValue("motion_only", self.motion_only_check.isChecked())
         settings.setValue("skip_pixel_coords", self.skip_pixel_check.isChecked())
@@ -906,12 +1056,15 @@ class UnlooperWindow(QMainWindow):
         method = self.comp_method_combo.currentData()
         self.comp_method_combo.setEnabled(not unloop_only)
         isbf = method in ("overshoot", "pointwise")
-        self.comp_rapid_spin.setEnabled(isbf or method == "hybrid")
+        self.comp_rapid_spin.setEnabled(isbf or method in ("hybrid", "hybrid_constant"))
         self.comp_scale_spin.setEnabled(isbf)
         self.comp_slow_spin.setEnabled(method == "slowdown")
         self.comp_iter_spin.setEnabled(isbf or method in ("iterative", "hybrid"))
         self.comp_spacing_spin.setEnabled(method == "pointwise")
         self.comp_corner_spin.setEnabled(method == "hybrid")
+        self.diam_hold_check.setEnabled(method == "hybrid")
+        self.time_keep_check.setEnabled(isbf)
+        self.blend_spin.setEnabled(isbf)
 
     def _update_run_enabled(self):
         running = self.process is not None and self.process.state() != QProcess.ProcessState.NotRunning
@@ -1014,7 +1167,10 @@ class UnlooperWindow(QMainWindow):
         # <corner tolerance um>
         compensation = [self.comp_method_combo.currentData(), str(self.comp_rapid_spin.value()),
                         str(self.comp_scale_spin.value()), str(self.comp_slow_spin.value()), str(int(self.comp_iter_spin.value())),
-                        str(self.comp_spacing_spin.value()), str(self.comp_corner_spin.value())]
+                        str(self.comp_spacing_spin.value()), str(self.comp_corner_spin.value()),
+                        str(self.diam_tol_spin.value() if self.diam_hold_check.isChecked() else 0),
+                        str(self.mandrel_spin.value()), str(self.diam_tol_spin.value()),
+                        "1" if self.time_keep_check.isChecked() else "0", str(self.blend_spin.value())]
         self.process.setArguments([str(UNLOOPER_SCRIPT), self._active_file, unloop_only, feedrate, density, fibre_diameter,
                                    render_mode, accel, junction, skip_pixel, jerk, lag, cts, write_files] + compensation)
         self.process.readyReadStandardOutput.connect(self._on_output)
@@ -1067,7 +1223,13 @@ class UnlooperWindow(QMainWindow):
             m = JET_DEVIATION_RE.search(line)
             if m:
                 self._result_labels["comp_dev"].setText(self._short_deviation(m.group(1)))
+            m = FIBRE_RE.search(line)
+            if m:
+                self._result_labels["comp_fibre"].setText(f"{m.group(2)}% (±{m.group(1)}%), thickest ×{m.group(3)}")
             return
+        m = FIBRE_RE.search(line)
+        if m:
+            self._result_labels["fibre"].setText(f"{m.group(2)}% (±{m.group(1)}%), thickest ×{m.group(3)}")
         m = JET_DEVIATION_RE.search(line)
         if m:
             self._result_labels["jet_dev"].setText(self._short_deviation(m.group(1)))
@@ -1257,6 +1419,44 @@ class UnlooperWindow(QMainWindow):
                 return True
         return False
 
+    def _diameter_edges(self):
+        # d / d0 band edges for the fibre diameter view, from the tolerance
+        t = self.diam_tol_spin.value() / 100.0
+        return np.array([max(1 - 3 * t, 0.0), 1 - 2 * t, 1 - t, 1 + t, 1 + 2 * t, 1 + 4 * t, 1 + 6 * t])
+
+    def _on_diameter_tolerance_changed(self, *_args):
+        if self.colour_mode_combo.currentData() == "diam" and self._preview_segments is not None:
+            self._rebuild_preview_items()
+
+    def _export_compensated(self):
+        # Save the last run's lag-compensated G-code for printing, in the chosen comment style
+        from unlooper_core.lag_compensation import export_gcode
+        if not getattr(self, "_active_file", None):
+            self.status_label.setText("Run a file with a lag compensation method first")
+            return
+        src = self._output_dir() / f"{self._stem()}_Lag_compensated.txt"
+        if not src.exists():
+            self.status_label.setText(f"No compensated file for this run ({src.name}) - run with a lag compensation method")
+            return
+        default = str(Path(self._active_file).with_name(f"{self._stem()}_Lag_compensated.txt"))
+        dst, _ = QFileDialog.getSaveFileName(self, "Export compensated G-code", default, "G-code (*.txt *.gcode *.nc);;All files (*)")
+        if not dst:
+            return
+        export_gcode(str(src), dst, self.comment_combo.currentData())
+        self.status_label.setText(f"Exported: {dst}")
+
+    def _open_mandrel_view(self):
+        from PySide6.QtGui import QDesktopServices
+        from PySide6.QtCore import QUrl
+        if not getattr(self, "_active_file", None):
+            self.status_label.setText("Run a file with a mandrel diameter set first")
+            return
+        image = self._output_dir() / f"{self._stem()}_mandrel.png"
+        if not image.exists():
+            self.status_label.setText("No mandrel image for this run - set a mandrel diameter and run again")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(image)))
+
     def _layer_on(self, key):
         return self.layer_checks[key].isChecked()
 
@@ -1286,14 +1486,14 @@ class UnlooperWindow(QMainWindow):
         # Speed / acceleration colouring draws the pixel coords instead of the G-code moves,
         # jet lag colouring draws the jet contact points
         mode = self.colour_mode_combo.currentData()
-        if mode in ("lag", "isbf"):
+        if mode in ("lag", "isbf", "diam"):
             return self._lag_samples is not None or self._comp is not None
         return mode in ("speed", "accel") and self._preview_samples is not None
 
     def _active_lines(self):
         if not self._sample_mode():
             return self._preview_lines
-        if self.colour_mode_combo.currentData() in ("lag", "isbf"):
+        if self.colour_mode_combo.currentData() in ("lag", "isbf", "diam"):
             samples = self._primary_lag()[0]
             return samples[:, 3] if samples is not None else np.zeros(0)
         return self._preview_sample_lines
@@ -1324,7 +1524,7 @@ class UnlooperWindow(QMainWindow):
                 item.setPen(QPen(QColor(*colour), 0))
                 scene.addItem(item)
                 self._underlay_items.append(item)
-        if self._two_hue():
+        if self._two_hue() and self.colour_mode_combo.currentData() != "diam":
             # The other jet, under the chunked one
             samples, (v_min, v_max), which = ((self._lag_samples, self._lag_range, "original") if self._isbf_colours()
                                               else (self._comp["lag_samples"], self._comp["lag_range"], "compensated"))
@@ -1340,7 +1540,7 @@ class UnlooperWindow(QMainWindow):
                 self._underlay_items.append(item)
 
     def _build_all_chunks(self):
-        if self.colour_mode_combo.currentData() in ("lag", "isbf") and self._sample_mode():
+        if self.colour_mode_combo.currentData() in ("lag", "isbf", "diam") and self._sample_mode():
             self._add_static_lag_layers()
         total = len(self._active_lines())
         for start in range(0, total, PREVIEW_CHUNK):
@@ -1350,6 +1550,21 @@ class UnlooperWindow(QMainWindow):
         scene = self.preview_view.scene()
         if self._sample_mode():
             mode = self.colour_mode_combo.currentData()
+            if mode == "diam":
+                source = self._primary_lag()[0]
+                if source is None or source.shape[1] < 5:
+                    return []
+                samples = source[start:stop + 1 if join_next else stop][:, [0, 1, 4, 3]]
+                edges = self._diameter_edges()[1:-1]
+                paths = build_sample_paths(samples, lambda v, a: int(np.searchsorted(edges, v)))
+                colours = self._band_colours(DIAMETER_COLOURS, self._highlight)
+                items = []
+                for key, path in paths.items():
+                    item = QGraphicsPathItem(path)
+                    item.setPen(QPen(colours.get(key, QColor("white")), 0))
+                    self.preview_view.scene().addItem(item)
+                    items.append(item)
+                return items
             if mode in ("lag", "isbf"):
                 source, (v_min, v_max), which = self._primary_lag()
                 if source is None:
@@ -1380,12 +1595,22 @@ class UnlooperWindow(QMainWindow):
 
     def _update_legend(self):
         mode = self.colour_mode_combo.currentData()
-        self.layer_widget.setVisible(mode in ("lag", "isbf"))
+        self.layer_widget.setVisible(mode in ("lag", "isbf", "diam"))
         self.comp_legend.setVisible(False)
         if mode == "kind":
             self.speed_legend.setVisible(False)
             return
         self.speed_legend.setVisible(True)
+        if mode == "diam":
+            samples, _range, which = self._primary_lag()
+            if self._raster_loaded and self._preview_segments is None:
+                self.speed_legend.set_message("Fibre diameter view needs Render: preview (or both)")
+            elif samples is None or samples.shape[1] < 5:
+                self.speed_legend.set_message("No fibre diameter data - run with 'Lag prediction' ticked (re-run older results)")
+            else:
+                self.speed_legend.set_bands(self._diameter_edges(), f"x fibre diameter ({which}, ±{self.diam_tol_spin.value():g}%)",
+                                            decimals=2, colours=DIAMETER_COLOURS)
+            return
         if mode == "isbf":
             if self._raster_loaded:
                 self.speed_legend.set_entries([(ISBF_PROGRAMMED, "Programmed path"), (ISBF_JET_BEFORE, "Jet before"),
@@ -1509,20 +1734,21 @@ class UnlooperWindow(QMainWindow):
             return False
         self._raster_loaded = True
         self._raster = None
+        status = self.status_label.text()
+        self.status_label.setText(f"Loading {image_path.name}...")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QApplication.processEvents()
         try:
-            with Image.open(image_path) as pil_image:
-                if pil_image.mode == "P":
-                    palette = np.asarray(pil_image.getpalette()[:768], dtype=np.uint8).reshape(-1, 3)
-                    self._raster = (np.asarray(pil_image), palette)
-        except (OSError, ValueError):
-            self._raster = None
-        if self._raster is not None:
-            return self._show_raster()
-        image = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
-        if image is None:
+            kind, image, palette = read_raster_preview(image_path)
+        except (OSError, ValueError, MemoryError, cv2.error) as error:
+            self.status_label.setText(f"Could not load {image_path.name}: {error}")
             return False
-        if len(image.shape) == 3:
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.status_label.setText(status)
+        if kind == "P":
+            self._raster = (image, palette)
+            return self._show_raster()
         return self._show_image(image)
 
     def _show_raster(self):

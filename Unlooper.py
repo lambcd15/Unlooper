@@ -3,9 +3,13 @@
     python Unlooper.py <file> <unloop_only 0|1> [feedrate mm/min] [density g/cm3] [fibre diameter um]
                        [render precise|preview|both|none] [acceleration mm/s2] [junction deviation mm]
                        [skip pixel coords 1|0] [jerk mm/s] [lag prediction 1|0] [CTS mm/min]
-                       [write lag-format files 1|0] [lag compensation none|overshoot|pointwise|slowdown|iterative|hybrid]
+                       [write lag-format files 1|0] [lag compensation none|overshoot|pointwise|slowdown|iterative|hybrid|hybrid_constant]
                        [rapid mm/min] [overshoot scale] [slow-down ratio of CTS] [iterations]
                        [pointwise point spacing um, 0 = adaptive] [hybrid corner tolerance um]
+                       [hybrid: fibre diameter limit %, 0 = none] [mandrel diameter mm, 0 = flat]
+                       [fibre diameter tolerance % for the diameter view]
+                       [overshoot / pointwise: time-preserving feeds 1|0]
+                       [overshoot / pointwise: swing blend radius um, -1 = automatic, 0 = off]
 
 This file holds the settings, the command line and the order the stages run in; the
 stages themselves live in unlooper_core/ (see unlooper_core/__init__.py):
@@ -154,6 +158,42 @@ if __name__ == "__main__":
         "Lag_comp_iterations": 6,  # overshoot / pointwise / iterative: correction passes (0 = none)
         "Lag_comp_point_spacing_um": 0.0,  # pointwise: distance between the points compensated (0 = adaptive)
         "Lag_comp_corner_um": 20.0,  # hybrid: how far the nozzle may jump round a sharp corner (smaller = closer, slower)
+        # hybrid: how much the fibre diameter may change (%), d / d0 = sqrt(v0 / v), 0 = no limit.
+        # It sets how far the jet may slow: 5% -> 9.3% slower at most (Lag_comp_speed_change_pct).
+        "Lag_comp_diameter_limit_pct": 0.0,
+        "Lag_comp_speed_change_pct": 100.0,
+        # The tolerance the fibre diameter is reported and coloured against (%)
+        "Diameter_tolerance_pct": 5.0,
+        # What the fibre diameter is worked out from: "nozzle" (the nozzle's speed over the
+        # collector - only slowing thickens the fibre, as printed) or "jet" (the model's contact point)
+        "Diameter_basis": "nozzle",
+        # overshoot / pointwise options, all off by default:
+        #   time-preserving feeds - each command's moves sped up (never slowed) so they take the
+        #   time the command was programmed to take, and the path solved again at those feeds
+        "Lag_comp_time_preserving": False,
+        #   smooth swings - the kinks between each overshoot line, its swing arc and the next line
+        #   blended with a fillet arc of this radius (um) so the nozzle never brakes below the feed.
+        #   -1 = automatic (pointwise: v^2 / (0.85 x acceleration); overshoot: off, the original
+        #   ISBF output), 0 = off
+        "Lag_comp_blend_um": -1.0,
+        #   adaptive spacing only: swings no smaller than the fibre diameter limit's lag
+        "Lag_comp_adaptive_hold_swing": False,
+        #   adaptive spacing only: the smallest turn swung round (degrees; ISBF's is 5). The lead
+        #   factor can be set apart from the overshoot scale with Lag_comp_adaptive_lead.
+        "Lag_comp_adaptive_swing_deg": 30.0,
+        #   adaptive spacing only: gentler turns (a curve written as short lines) are steered
+        #   round - the nozzle moves across onto each new line faster than the feed, never slower
+        "Lag_comp_adaptive_steer": True,
+        #   adaptive spacing only: "isbf" = arcs by ISBF's arc joins, "chords" = arcs cut into
+        #   short lines and steered round (many more lines; no better on the files tried)
+        "Lag_comp_adaptive_arcs": "isbf",
+        #   the corrections to the ISBF code (see unlooper_core/isbf.py): every swing onto an arc
+        #   at the rapid feed, no divide by zero at a zero-length line after an arc, and every
+        #   arc written as a true arc (start and end at the same radius). False = as it was.
+        "Lag_comp_isbf_fixes": True,
+        # Tubular printing: mandrel diameter (mm). With it set, A (degrees) is read as the distance
+        # round the tube's surface (mandrel.py), and the compensated file is written with A.
+        "Mandrel_diameter_mm": 0.0,
     }
     
     # ************************************ User Variables ******************************************
@@ -216,6 +256,20 @@ if __name__ == "__main__":
             variables["Lag_comp_point_spacing_um"] = float(sys.argv[19])
         if len(sys.argv) >= 21:
             variables["Lag_comp_corner_um"] = float(sys.argv[20])
+        if len(sys.argv) >= 22:
+            variables["Lag_comp_diameter_limit_pct"] = float(sys.argv[21])
+        if len(sys.argv) >= 23:
+            variables["Mandrel_diameter_mm"] = float(sys.argv[22])
+        if len(sys.argv) >= 24:
+            variables["Diameter_tolerance_pct"] = float(sys.argv[23])
+        if len(sys.argv) >= 25:
+            variables["Lag_comp_time_preserving"] = str(sys.argv[24]).strip() == "1"
+        if len(sys.argv) >= 26:
+            variables["Lag_comp_blend_um"] = float(sys.argv[25])
+
+    # A fibre diameter limit sets how far the jet may slow: d / d0 = sqrt(v0 / v) <= 1 + limit
+    if variables["Lag_comp_diameter_limit_pct"] > 0:
+        variables["Lag_comp_speed_change_pct"] = (1.0 - 1.0 / (1.0 + variables["Lag_comp_diameter_limit_pct"] / 100.0) ** 2) * 100.0
 
     # Compensation works from the lag model's predictions
     if variables["Lag_compensation"] != "none":
@@ -372,6 +426,9 @@ if __name__ == "__main__":
         if variables["Generate_preview_image"] == True:
             render_preview_svg(params, variables)
         save_outputs(params,variables)
+        if variables["Mandrel_diameter_mm"] > 0:
+            from unlooper_core.mandrel import render_program
+            render_program(params, variables)
         if variables["Lag_compensation"] != "none":
             from unlooper_core.lag_compensation import compensate, run_compensated
             print("************** Lag compensation **************")

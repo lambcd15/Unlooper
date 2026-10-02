@@ -36,7 +36,16 @@ what every part below builds on:
 
 The cost is time at sharp corners: the jet has to slow nearly to the CTS to turn one
 exactly, so a pattern made of short lines and sharp corners prints slower (lines and waves
-barely do).
+barely do). Slowing the jet also changes the fibre diameter there.
+
+Constant jet speed (compensate_hybrid_constant): the jet kept at the programmed speed, so
+the lag and the fibre diameter stay the same everywhere, as in ISBF. Then the jet can only
+turn as tightly as the nozzle can swing round it at the lag distance - radius r where a
+nozzle circling at sqrt(r^2 + Lag^2) at the jet's angular rate v / r stays within the
+acceleration and speed limits (about 0.8 mm at speed ratio 3, 1000 mm/s^2, 3000 mm/min).
+So the path is smoothed over TURN_SMOOTHING x that radius - only where it bends tighter, or
+everywhere, whichever lands the jet closer - and the nozzle leads by the lag along it.
+Features smaller than that radius are rounded off: that is the price of a constant diameter.
 """
 import math
 
@@ -60,6 +69,10 @@ RAPID_FRACTION = 0.9  # and its speed within this x the rapid speed
 PLANNER_FITS = 3  # rounds of matching the plan to the machine's planner
 PLANNER_WINDOW_MM = 0.5  # the planner's time is compared over this much path either side ...
 PLANNER_SHORTFALL = 0.9  # ... and taken as a limit where it is slower than this x asked
+CONSTANT_ACCEL_FRACTION = 0.5  # constant jet speed: the nozzle's swing round the jet stays within this x the acceleration ...
+CONSTANT_RAPID_FRACTION = 0.9  # ... and this x the rapid speed
+TURN_SMOOTHING = 0.65  # constant jet speed: the path is smoothed over this x the jet's tightest turn radius
+ARC_STEP_UM = 20.0  # the corner arcs are written as G1 chords this long at most
 PASS_GAIN = 0.98  # the passes stop at the first one that isn't at least 2% closer than the best so far
 SIM_MARGIN = 0.9  # a pass lowers the lag where the simulated jet ran with less than this x the plan
 POSITION_TOL_UM = 1.0  # the nozzle path is written as G1 moves this close to it ...
@@ -251,6 +264,24 @@ if njit is not None:
     _decimate = njit(cache=True)(_decimate)
 
 
+def _tightest_turn(v, lag, accel_limit, speed_limit):
+    # Smallest radius (mm) a jet moving at v (mm/s) can turn on while the nozzle leads it by
+    # `lag` (mm): the nozzle circles at radius sqrt(r^2 + lag^2), at the jet's angular rate
+    # v / r, within the acceleration and speed limits
+    if lag <= 0 or v <= 0:
+        return 0.0
+    lo, hi = 1e-4, 100.0
+    for _ in range(60):
+        r = math.sqrt(lo * hi)
+        w = v / r
+        rn = math.hypot(r, lag)
+        if w * w * rn > accel_limit or w * rn > speed_limit:
+            lo = r
+        else:
+            hi = r
+    return hi
+
+
 def stationary_lag(ratio, a, b):
     # Lag (mm) at speed ratio(s) `ratio` (0 at or below the CTS)
     ratio = np.asarray(ratio, dtype=np.float64)
@@ -290,19 +321,57 @@ class LeadPlan:
     # lag gives. build() writes it as G-code; planner_fit() and sim_fit() lower the lag where
     # the machine or the simulated jet showed the plan can't be kept.
 
-    def __init__(self, params, variables):
-        from .lag_compensation import GcodeWriter  # noqa: F401 (import check)
+    def __init__(self, params, variables, constant=False, smooth_all=False):
         self.params, self.variables = params, variables
+        self.constant = constant
         js, _dt, a, b, _eps = params["Lag_model"]
         self.js, self.a, self.b = js, a, b
         self.scale = scale = variables["scale"]
         self.rapid = float(variables["Lag_comp_rapid_mm_min"])
         corner_mm = float(variables.get("Lag_comp_corner_um", 20.0)) / 1000.0
+        # How much the jet may slow (%), which sets how much the fibre diameter may grow
+        # (d / d0 = sqrt(v0 / v)): the lag is never planned below the floor speed's
+        default = 0.0 if constant else 100.0
+        self.speed_change = min(max(float(variables.get("Lag_comp_speed_change_pct", default)), 0.0), 100.0)
         x, y, f, row_end = _program_polyline(params["Preview_segments"], variables)
         total_um = float(np.hypot(np.diff(x), np.diff(y)).sum())
         ds = self.ds = max(SAMPLE_UM, total_um / MAX_SAMPLES)
         at_vertex = np.zeros(len(x), dtype=np.int64)
-        px, py, ux, uy, fe, stretch, turn = _resample(x, y, f, ds, SHARP_DEG, at_vertex)
+        px, py, ux, uy, fe, stretch, turn = _resample(x, y, f, ds, 181.0 if constant else SHARP_DEG, at_vertex)
+        self.turn_radius = 0.0
+        if constant:
+            # The jet at the programmed speed everywhere, so the lag stays the same. Then it can
+            # only turn as tightly as the nozzle can swing round it at the lag distance, so it
+            # is steered along the path smoothed to that radius (no corners left to shed lag at)
+            from scipy.ndimage import gaussian_filter1d
+            turn[:] = 0.0  # no corners to jump at, reversals included: everything is turned
+            # With a speed change allowed, the jet may slow to (1 - change) x its speed at
+            # the tight bends only, where the smaller lag lets it turn tighter
+            floor = max(1.0 - self.speed_change / 100.0, js / max(float(f.max()), 1e-9))
+            feed = floor * float(f.max()) / 60.0
+            self.floor_lag = float(stationary_lag(floor * f.max() / js, a, b))
+            self.turn_radius = _tightest_turn(feed, self.floor_lag, CONSTANT_ACCEL_FRACTION * float(variables["Acceleration_mm_s2"]),
+                                              CONSTANT_RAPID_FRACTION * self.rapid / 60.0)
+            self.slow_at = None
+            sigma = TURN_SMOOTHING * self.turn_radius * scale / ds
+            if sigma > 0.5:
+                # Only where the path bends tighter than that (corners, small arcs), its
+                # curvature measured over a quarter of the radius, so gentler curves are kept;
+                # or everywhere (smooth_all), which suits a path made of little but corners
+                n = len(px)
+                w = max(int(0.125 * self.turn_radius * scale / ds), 1)
+                heading = np.unwrap(np.arctan2(uy, ux))
+                bend = np.abs(heading[np.minimum(np.arange(n) + w, n - 1)] - heading[np.maximum(np.arange(n) - w, 0)])
+                tight = bend / (2 * w * ds / scale) > 1.0 / self.turn_radius
+                near = np.minimum(1.0, 6.0 * gaussian_filter1d(tight.astype(np.float64), sigma, mode="nearest"))
+                self.slow_at = near > 0.05
+                weight = 1.0 if smooth_all else near
+                px = px + weight * (gaussian_filter1d(px, sigma, mode="nearest") - px)
+                py = py + weight * (gaussian_filter1d(py, sigma, mode="nearest") - py)
+                dx, dy = np.diff(px, append=px[-1]), np.diff(py, append=py[-1])
+                dx[-1], dy[-1] = dx[-2], dy[-2]
+                norm = np.maximum(np.hypot(dx, dy), 1e-12)
+                ux, uy = dx / norm, dy / norm
         # A sharp corner is sampled twice: arriving (direction in, end of its stretch) and
         # leaving (direction out); the nozzle jumps between the two
         n = len(px)
@@ -343,10 +412,21 @@ class LeadPlan:
         grid_v = js * speed_ratio(grid_lag, a, b) / 60.0
         accel_limit = ACCEL_FRACTION * float(variables["Acceleration_mm_s2"])
         cap = np.minimum(cap, _curvature_cap(kappa, grid_lag, grid_v, accel_limit, RAPID_FRACTION * self.rapid / 60.0))
+        if constant:
+            # Constant jet speed: the lag is never lowered (only ramped up at the start and
+            # down at the end and at dwells, where the nozzle stops) - or, with a speed change
+            # allowed, lowered to the floor speed's lag at the tight bends only
+            cap = np.full(n, np.inf)
+            if self.speed_change > 0 and self.slow_at is not None and len(self.slow_at) == n:
+                cap[self.slow_at] = self.floor_lag
         # ... and none at the start, the end and every dwell, where the nozzle is at rest
         must = np.zeros(n, dtype=np.bool_)
         must[self.corner_in] = True
         must[self.corner_out] = True
+        self.lag_floor = np.zeros(n)
+        if not constant and self.speed_change < 100.0:
+            self.lag_floor = stationary_lag((1.0 - self.speed_change / 100.0) * fe / js, a, b)
+            cap = np.maximum(cap, self.lag_floor)
         cap[0] = cap[-1] = 0.0
         self.dwell_at = {}
         for d in params.get("Dwells", []):
@@ -374,14 +454,49 @@ class LeadPlan:
         dt = np.zeros(self.n)
         dt[1:] = self.seg_mm / np.maximum(0.5 * (v[1:] + v[:-1]), 1e-9)  # minutes
         ci, co = self.corner_in, self.corner_out
-        dt[co] = np.hypot(nx[co] - nx[ci], ny[co] - ny[ci]) / scale / rapid  # the jump, at the rapid speed
+        self.lag, self.v = lag, v
+        dwell_at, next_must = self.dwell_at, self.next_must
+        origin = np.arange(self.n)
+        if len(ci):
+            # Round each sharp corner as the ISBF paper does (Lamb et al. 2026, Fig. 2): the
+            # nozzle, a lag past the vertex along the incoming line, swings round the vertex
+            # on an arc of radius = the lag at the cornering speed onto the outgoing line.
+            # With the lag shed to the corner tolerance this is a short hop; with it held
+            # (a small speed change allowed) it is the paper's full-lag swing.
+            radius = lag[ci] * scale
+            a0 = np.arctan2(self.ty[ci], self.tx[ci])
+            sweep = np.angle(np.exp(1j * (np.arctan2(self.ty[co], self.tx[co]) - a0)))
+            pieces = np.maximum(np.ceil(np.abs(sweep) * radius / ARC_STEP_UM).astype(np.int64), 1)
+            k = np.repeat(np.arange(len(ci)), pieces)
+            first = np.cumsum(pieces) - pieces
+            frac = (np.arange(len(k)) - first[k] + 1) / pieces[k]
+            ang = a0[k] + sweep[k] * frac
+            ax = self.px[ci][k] + radius[k] * np.cos(ang)
+            ay = self.py[ci][k] + radius[k] * np.sin(ang)
+            adt = (np.abs(sweep) * radius / scale / pieces / rapid)[k]
+            at = np.repeat(co, pieces)
+            dt[co] = 0.0  # the arc ends on the outgoing lead point
+            nx, ny = np.insert(nx, at, ax), np.insert(ny, at, ay)
+            dt = np.insert(dt, at, adt)
+            origin = np.insert(origin, at, np.repeat(ci, pieces))
+            shift = lambda q: q + np.searchsorted(at, q, side="right")
+            dwell_at = {int(shift(q)): secs for q, secs in dwell_at.items()}
+            must = np.zeros(len(nx), dtype=np.bool_)
+            must[shift(ci)] = True
+            must[shift(co)] = True
+            for q in dwell_at:
+                must[q] = True
+            idx = np.where(must, np.arange(len(nx)), len(nx) - 1)
+            next_must = np.minimum.accumulate(idx[::-1])[::-1]
+            next_must = np.concatenate((next_must[1:], [len(nx) - 1]))
         tt = np.cumsum(dt)
-        keep = _decimate(nx, ny, tt, self.next_must, POSITION_TOL_UM, SPEED_TOL, MAX_CHORD)
+        keep = _decimate(nx, ny, tt, next_must, POSITION_TOL_UM, SPEED_TOL, MAX_CHORD)
         writer = GcodeWriter(scale, (0.0, 0.0))
         writer.g1(nx[0], ny[0], v[0])
+        self.last_xy = (nx, ny)
         rows, ranges = [], []
         for i0, i1 in zip(keep[:-1].tolist(), keep[1:].tolist()):
-            for seconds in self.dwell_at.get(i0, ()):
+            for seconds in dwell_at.get(i0, ()):
                 writer.dwell(seconds)
             dist = math.hypot(nx[i1] - nx[i0], ny[i1] - ny[i0]) / scale
             dur = tt[i1] - tt[i0]
@@ -389,10 +504,10 @@ class LeadPlan:
             writer.g1(nx[i1], ny[i1], feed)
             if dist > 1e-7:
                 rows.append((1, nx[i0], ny[i0], nx[i1], ny[i1], 0.0, 0.0, 0.0, len(rows), feed / 60.0, len(rows)))
-                ranges.append((i0, i1))
-        for seconds in self.dwell_at.get(self.n - 1, ()):
+                ranges.append((origin[i0], origin[i1]))
+        for seconds in dwell_at.get(len(nx) - 1, ()):
             writer.dwell(seconds)
-        self.lag, self.v, self.rows, self.ranges = lag, v, rows, np.asarray(ranges, dtype=np.int64).reshape(-1, 2)
+        self.rows, self.ranges = rows, np.asarray(ranges, dtype=np.int64).reshape(-1, 2)
         self.plan_time = float(tt[-1] * 60.0)
         return writer.lines
 
@@ -401,7 +516,7 @@ class LeadPlan:
         where[self.corner_out] = False
         if not where.any():
             return 0
-        self.cap = np.where(where, np.minimum(self.cap, lag), self.cap)
+        self.cap = np.where(where, np.minimum(self.cap, np.maximum(lag, self.lag_floor)), self.cap)
         return int(where.sum())
 
     def planner_fit(self):
@@ -451,14 +566,110 @@ class LeadPlan:
         return self._lower(self._timing_matters() & (ran < SIM_MARGIN * self.lag), ran)
 
 
+def program_lines(params, variables):
+    # The program itself as absolute G-code lines (lines and arcs as they are, with its dwells)
+    from .lag_compensation import GcodeWriter
+    scale = variables["scale"]
+    override = variables["Feedrate_override_mm_min"]
+    segments = params["Preview_segments"]
+    dwells = {}
+    for d in params.get("Dwells", []):
+        dwells.setdefault(int(d[0]), []).append(float(d[1]))
+    writer = GcodeWriter(scale, (0.0, 0.0))
+    for i, (kind, x1, y1, x2, y2, cx, cy, sweep, _line, feed, *_) in enumerate(segments):
+        for seconds in dwells.get(i, ()):
+            writer.dwell(seconds)
+        f = override if override > 0 else feed * 60.0
+        if abs(writer.x - x1) > 0.01 or abs(writer.y - y1) > 0.01:
+            writer.g1(x1, y1, f)
+        if kind == 1:
+            writer.g1(x2, y2, f)
+        else:
+            writer.arc(x2, y2, cx, cy, sweep > 0, f)
+    for seconds in dwells.get(len(segments), ()):
+        writer.dwell(seconds)
+    return writer.lines
+
+
+def compensate_hybrid_constant(params, variables, score, baseline):
+    # The hybrid with the jet never slowing (0% speed change): constant fibre diameter
+    return compensate_hybrid(params, dict(variables, Lag_comp_speed_change_pct=0.0), score, baseline)
+
+
+def _hybrid_rounded(params, variables, score, baseline):
+    # The hybrid with the jet at the programmed speed throughout, so the lag - and the fibre
+    # diameter that goes with the jet speed - stay the same, as in ISBF. The nozzle leads by
+    # the lag along the path smoothed to the tightest turn the jet can make at that speed.
+    # Two ways to smooth (only the tight bends, or the whole path); the closer one is kept.
+    from .lag_compensation import rows_from_gcode
+    best = None
+    for smooth_all in (False, True):
+        plan = LeadPlan(params, variables, constant=True, smooth_all=smooth_all)
+        lines = plan.build()
+        res = score(*rows_from_gcode(lines, variables["scale"]))
+        how = "the whole path" if smooth_all else "the tight bends"
+        print("Lag compensation (hybrid, constant jet speed): lag", round(float(plan.lag_nominal.max()), 3),
+              "mm throughout; tightest jet turn at full speed", round(plan.turn_radius, 3), "mm radius;", how,
+              "smoothed over", round(TURN_SMOOTHING * plan.turn_radius, 3), f"mm: jet off the path by mean {res.mean:.2f} um, "
+              f"print {res.duration:.1f} s")
+        if best is None or res.mean < best[0]:
+            best = (res.mean, lines)
+    print(f"Lag compensation (hybrid, constant jet speed): uncompensated jet off the path by mean {baseline.mean:.2f} um; "
+          f"using the closer, mean {best[0]:.2f} um")
+    return best[1]
+
+
 def compensate_hybrid(params, variables, score, baseline):
+    # With the full speed change allowed (100%) the jet slows as far as each sharp corner
+    # needs. With less, two ways of turning within that diameter limit are tried - the
+    # paper's arc round each corner at the floor speed's lag, and rounding the path to the
+    # jet's tightest turn at that speed - and the closer is kept.
+    from .lag_compensation import rows_from_gcode
+    change = float(variables.get("Lag_comp_speed_change_pct", 100.0))
+    if change < 100.0:
+        # Any of these keeps within the limit (the constant-speed rounding more than keeps it)
+        scale = variables["scale"]
+        candidates = [("corner arcs", _hybrid_shed(params, variables, score, baseline)),
+                      ("rounded path", _hybrid_rounded(params, variables, score, baseline))]
+        if change > 0:
+            candidates.append(("rounded path at constant speed",
+                               _hybrid_rounded(params, dict(variables, Lag_comp_speed_change_pct=0.0), score, baseline)))
+        # ... and the program as it is: at a low speed ratio the lag is small, and holding
+        # the diameter tight can cost more than the lag does
+        candidates.append(("programmed path unchanged", program_lines(params, variables)))
+        # Judge each on the simulated jet: the fibre diameter it really lays down (the machine
+        # may slow the nozzle more than planned) and how far it lands from the path. The most
+        # accurate one whose thickest fibre (95th percentile) is within the limit is kept; if
+        # none is, the one that comes closest to the limit.
+        limit = float(variables.get("Lag_comp_diameter_limit_pct", 0.0)) / 100.0
+        if limit <= 0:
+            limit = 1.0 / math.sqrt(max(1.0 - change / 100.0, 1e-6)) - 1.0
+        feed = float(np.median([row[9] for row in params["Preview_segments"]])) if params["Preview_segments"] else 1.0
+        results = []
+        for name, lines in candidates:
+            res = score(*rows_from_gcode(lines, scale))
+            # fibre diameter from the nozzle's speed over the collector (as lag_model reports it)
+            v = np.hypot(np.diff(res.x), np.diff(res.y)) / (score.dt * score.stride) / 1000.0
+            thick = float(np.percentile(np.sqrt(feed / np.maximum(v[score.start_cut:], 1e-6)), 95)) if len(v) > score.start_cut else 1.0
+            results.append((name, lines, res.mean, thick))
+        ok = [r for r in results if r[3] <= 1.0 + limit + 0.005]
+        best = min(ok, key=lambda r: r[2]) if ok else min(results, key=lambda r: (r[3], r[2]))
+        print(f"Lag compensation (hybrid, fibre diameter within +{limit * 100:.1f}%): " +
+              ", ".join(f"{name} {m:.2f} um (fibre up to x{t:.2f})" for name, _l, m, t in results) +
+              f"; using the {best[0]}" + ("" if ok else " (none keeps within the limit on this machine; closest)"))
+        return best[1]
+    return _hybrid_shed(params, variables, score, baseline)
+
+
+def _hybrid_shed(params, variables, score, baseline):
     from .lag_compensation import rows_from_gcode
     scale = variables["scale"]
     iterations = int(variables["Lag_comp_iterations"])
     plan = LeadPlan(params, variables)
     lines = plan.build()
     print("Lag compensation (hybrid):", plan.n, "path points", round(plan.ds, 1), "um apart,", len(plan.corner_in),
-          "sharp corners (tolerance", variables.get("Lag_comp_corner_um", 20.0), "um),", len(plan.dwell_at), "dwells")
+          "sharp corners (tolerance", variables.get("Lag_comp_corner_um", 20.0), "um),", len(plan.dwell_at), "dwells; jet may slow",
+          f"{plan.speed_change:g}% (fibre up to x{1 / math.sqrt(max(1 - plan.speed_change / 100, 1 / max(float(plan.fe.max()) / plan.js, 1))):.2f})")
     for k in range(PLANNER_FITS):
         changed = plan.planner_fit()
         if changed == 0:

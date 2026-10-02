@@ -29,7 +29,10 @@ at the limit, Marlin's junction speeds, the swing capped at sqrt(accel x radius)
 G1 corner the overshoot is the one that, simulated through the swing and back onto the
 next line, keeps the jet closest to the path - a grid and golden-section search on the lag
 model. Along a line the nozzle leads the jet by factor x its lag, but never past the next
-corner (that overshoot is solved there).
+corner (that overshoot is solved there). Turns gentler than the swing threshold (a curve
+written as short lines) are steered round: the nozzle carries on at the feed and moves
+across onto each new line as fast as the machine allows, so it is never slower than the
+feed and the jet keeps its lag - and its speed - round the curve.
 
 What changed from vector_angle (the geometry is the same):
   - only the G1 -> G1 geometry that ran is kept: vector_angle also had Point 4 measured
@@ -42,6 +45,17 @@ What changed from vector_angle (the geometry is the same):
   - `extra` / `arc_extra` add to the overshoot / arc reset distance at given joins, for the
     correction passes in lag_compensation.py
   - runs of G1 pieces along one line can be written as one move (`merge`)
+
+Corrections to vector_angle (`fixes`, on unless Lag_comp_isbf_fixes is False):
+  - G1 -> G2/3: the swing onto the arc was written with the rapid feed for only two of its
+    four cases (which way it turns x G2 or G3); the other two ran at the last feed set. All four
+    now swing at the rapid feed.
+  - G2/3 -> G1 with the G1 of no length (a dwell point, a move in another axis) divided by
+    zero; it is now passed without a swing.
+  - an arc ended a reset distance early / late had its centre moved by half the change,
+    which leaves the start and end at different radii (a controller that checks arcs, e.g.
+    GRBL, stops on these). The written arcs are put back on a true circle through their
+    start and end (lag_compensation.true_arcs).
 """
 import math
 import re
@@ -64,6 +78,7 @@ def _jit(f):
 NUMBER_RE = re.compile(r"[^\W\d_]+|[-+]?(?:\d*\.*\d+)")
 ROUND_NUM = 5
 ANGLE_BOUND = 5
+STEER_GAIN = 0.7  # continuous mode: how hard the nozzle moves across onto the line (1 = the braking limit)
 RAPID_FEEDRATE = 3000
 LAG_LENGTH_REDUCTION_FACTOR = 0.85  # "0.85 used for a SR of 1.3 and 1.5, 1.0 used for max speed"
 
@@ -508,8 +523,10 @@ def _solve_overshoot(st, lo, vx, vy, ux, uy, uix, uiy, ccw, feed, next_feed, rap
     return c1 if f1 < f2 else c2
 
 
-def _is_swing(p1x, p1y, p2x, p2y, p3x, p3y):
-    # vector_angle's test: the angle at Point 2 between 5 and 175 degrees
+def _is_swing(p1x, p1y, p2x, p2y, p3x, p3y, gentlest):
+    # vector_angle's test: the angle at Point 2 between 5 and 175 degrees, i.e. the path
+    # turning by 5 to 175 degrees (gentlest = 5; the continuous mode can be given a larger
+    # smallest turn, leaving gentler ones to the lead)
     ax, ay = p1x - p2x, p1y - p2y
     bx, by = p3x - p2x, p3y - p2y
     na = math.sqrt(ax * ax + ay * ay)
@@ -518,25 +535,28 @@ def _is_swing(p1x, p1y, p2x, p2y, p3x, p3y):
         return False
     c = min(1.0, max(-1.0, (ax * bx + ay * by) / (na * nb)))
     theta = math.degrees(math.acos(c))
-    return ANGLE_BOUND < theta < 180 - ANGLE_BOUND
+    return ANGLE_BOUND < theta < 180 - gentlest
 
 
 def _g1_joins(p, extra, fixed, st, lag_length, factor, rapid, dt_s, js, a, b, eps, mode, out, accel, deviation, jerk,
-              min_speed):
+              min_speed, swing_min, min_overshoot, steer):
     # A run of G1 -> G1 joins. p rows: P1 x, y, P2 x, y, P3 x, y (Point 1 - 3), feed of this
     # command, the next command as a relative move (dx, dy, feed). out rows: P4 x, y, arc
-    # written, P5 x, y, G3, I, J, overshoot, swing. Returns the lag for the next join and
-    # the lag used for the last one.
+    # written, P5 x, y, G3, I, J, overshoot, swing, feed of the G1. Returns the lag for the
+    # next join and the lag used for the last one.
     lag_previous = lag_length
     trk = np.zeros(8)
     n = p.shape[0]
+    nvx = 0.0  # continuous mode, steering: the nozzle's velocity (mm/s) from piece to piece
+    nvy = 0.0
+    have_v = False
     # Continuous mode: where the next swing is along the run, so a lead taken along the
     # line never carries the nozzle past that corner (its overshoot is solved there)
     next_swing = np.full(n, -1, dtype=np.int64)
     upcoming = -1
     for k in range(n - 1, -1, -1):
         next_swing[k] = upcoming
-        if _is_swing(p[k, 0], p[k, 1], p[k, 2], p[k, 3], p[k, 4], p[k, 5]):
+        if _is_swing(p[k, 0], p[k, 1], p[k, 2], p[k, 3], p[k, 4], p[k, 5], swing_min if mode == 1 else ANGLE_BOUND):
             upcoming = k
     for k in range(n):
         p1x, p1y, p2x, p2y, p3x, p3y, feed_1 = p[k, 0], p[k, 1], p[k, 2], p[k, 3], p[k, 4], p[k, 5], p[k, 6]
@@ -550,11 +570,12 @@ def _g1_joins(p, extra, fixed, st, lag_length, factor, rapid, dt_s, js, a, b, ep
             c = (ax * bx + ay * by) / (na * nb)
             c = min(1.0, max(-1.0, c))
             theta = math.degrees(math.acos(c))
-        swing = ANGLE_BOUND < theta < 180 - ANGLE_BOUND
+        swing = ANGLE_BOUND < theta < 180 - (swing_min if mode == 1 else ANGLE_BOUND)
         ccw = ((p2x - p1x) * (p3y - p1y) - (p2y - p1y) * (p3x - p1x)) > 0
         out[k, 9] = 1.0 if swing else 0.0
         out[k, 5] = 1.0 if ccw else 0.0
         out[k, 2] = 0.0
+        out[k, 10] = feed_1
         if mode == 0:
             # vector_angle
             d = lag_length * factor + extra[k]
@@ -597,7 +618,9 @@ def _g1_joins(p, extra, fixed, st, lag_length, factor, rapid, dt_s, js, a, b, ep
             else:
                 d = _solve_overshoot(st, max(x0, 0.0), p2x, p2y, ux, uy, uix, uiy, ccw, feed_1, nf, rapid, dt_s, js, a,
                                      b, eps, accel, deviation, jerk, min_speed)
-            d = max(d + extra[k], max(x0, 0.0))
+            # never less than min_overshoot: the jet leaves the corner with that much lag,
+            # which sets its speed (and the fibre diameter) after the corner
+            d = max(d + extra[k], max(x0, 0.0), min_overshoot)
             p4x = _r(p2x + ux * d, ROUND_NUM)
             p4y = _r(p2y + uy * d, ROUND_NUM)
             p5x = _r(p2x + uix * d, ROUND_NUM)
@@ -612,6 +635,7 @@ def _g1_joins(p, extra, fixed, st, lag_length, factor, rapid, dt_s, js, a, b, ep
             st[3] = p5x if d > 1e-5 else p4x
             st[4] = p5y if d > 1e-5 else p4y
             st[6] = rapid if d > 1e-5 else feed_1
+            have_v = False
             if d > 1e-5:
                 out[k, 2] = 1.0
                 out[k, 6] = _r(p2x - p4x, ROUND_NUM)
@@ -626,7 +650,56 @@ def _g1_joins(p, extra, fixed, st, lag_length, factor, rapid, dt_s, js, a, b, ep
             if next_swing[k] >= 0:
                 j = next_swing[k]
                 cap = (p[j, 2] - p2x) * ux + (p[j, 3] - p2y) * uy
-            if speed > 0 and x < min(factor * st[2] + extra[k], cap):
+            if steer and speed > 0 and accel > 0 and x < min(factor * st[2] + extra[k], cap):
+                # Steering: the jet moves towards the nozzle, so to lay it along this line the
+                # nozzle has to be on the line ahead of it. Where the path has turned (gently -
+                # a sharp turn is swung round) the nozzle is off to one side: it carries on
+                # along the line at the feed and at the same time moves across onto it as fast
+                # as the acceleration allows, up to the rapid feed overall - never slower than
+                # the feed, so the fibre keeps its diameter, and with the extra speed the jet's
+                # lag (and so its own speed) holds round the curve.
+                nx_, ny_ = -uy, ux
+                off = (qx - p2x) * nx_ + (qy - p2y) * ny_
+                if not have_v:
+                    nvx = st[7] * ux
+                    nvy = st[7] * uy
+                    have_v = True
+                w_max = math.sqrt(max((rapid / 60.0) ** 2 - speed * speed, 0.0))
+                h = dt_s - st[5]
+                travelled = 0.0
+                elapsed = 0.0
+                while True:
+                    w = min(STEER_GAIN * math.sqrt(2.0 * accel * abs(off)), w_max)
+                    if abs(off) < 1e-6:
+                        w = 0.0
+                    sgn_off = -1.0 if off > 0 else 1.0
+                    dvx = speed * ux + sgn_off * w * nx_ - nvx
+                    dvy = speed * uy + sgn_off * w * ny_ - nvy
+                    dv = math.sqrt(dvx * dvx + dvy * dvy)
+                    if dv > accel * h:
+                        dvx *= accel * h / dv
+                        dvy *= accel * h / dv
+                    mx = (nvx + 0.5 * dvx) * h
+                    my = (nvy + 0.5 * dvy) * h
+                    nvx += dvx
+                    nvy += dvy
+                    qx += mx
+                    qy += my
+                    x += mx * ux + my * uy
+                    off += mx * nx_ + my * ny_
+                    travelled += math.sqrt(mx * mx + my * my)
+                    elapsed += h
+                    _step(st, qx, qy, js, dt_s / 60.0, a, b, eps)
+                    h = dt_s
+                    if x >= min(factor * st[2] + extra[k], cap) or travelled >= 100.0:
+                        break
+                st[5] = 0.0
+                st[7] = math.sqrt(nvx * nvx + nvy * nvy)
+                if elapsed > 0:
+                    # the feed the piece is written at: its mean speed, in steps of 5% of the feed
+                    step = 0.05 * feed_1
+                    out[k, 10] = max(feed_1, min(rapid, step * math.floor(travelled / elapsed * 60.0 / step + 0.5)))
+            elif speed > 0 and x < min(factor * st[2] + extra[k], cap):
                 h = dt_s - st[5]
                 v = st[7]
                 limit = x0 + 100.0
@@ -747,7 +820,8 @@ class Program:
 # --- vector_angle ---------------------------------------------------------------------------------
 
 def vector_angle(params, variables, js, a, b, factor=LAG_LENGTH_REDUCTION_FACTOR, rapid=RAPID_FEEDRATE,
-                 extra=None, arc_extra=None, mode="isbf", fixed=None, merge=False):
+                 extra=None, arc_extra=None, mode="isbf", fixed=None, merge=False, swing_min=ANGLE_BOUND,
+                 min_overshoot=0.0, feeds=None, with_owner=False, steer=False, fixes=True):
     # Returns the lag-compensated G-code lines (vector_angle's lag_compensated_code, with the
     # consecutive duplicate lines removed as it did), the G1 corners it swung round -
     # (command index, Point 1, Point 2 = the corner, Point 3, overshoot mm) - and the arc
@@ -756,6 +830,12 @@ def vector_angle(params, variables, js, a, b, factor=LAG_LENGTH_REDUCTION_FACTOR
     # `fixed` gives the continuous mode's corner overshoots instead of solving them again.
     # params["One_coordinate_system"] may be a Program already (the pointwise method's pieces).
     # `merge`: write runs of G1 pieces along one line as one move.
+    # `swing_min` / `min_overshoot` (continuous mode): the smallest turn swung round (deg) and
+    # the smallest swing (mm). `feeds`: a feed (mm/min) for every command in place of its own
+    # (time-preserving feeds). `with_owner`: also return the command each line was written for.
+    # `fixes`: the corrections to vector_angle listed in the module docstring (False = as it was).
+    # `steer` (continuous mode): past a gentle turn the nozzle moves across onto the new line
+    # (faster than the feed, never slower) instead of carrying on beside it.
     extra = extra or {}
     fixed = fixed or {}
     arc_extra = arc_extra or {}
@@ -770,8 +850,23 @@ def vector_angle(params, variables, js, a, b, factor=LAG_LENGTH_REDUCTION_FACTOR
     dt_s = float(variables["scatter_resolution"])
     code = ["G90", "G21", "G17"]
     if n_cmd < 2:
-        return code + [prog.text(i).split(";")[0].strip() for i in range(n_cmd)], corners, arc_joins
+        short = code + [prog.text(i).split(";")[0].strip() for i in range(n_cmd)]
+        return (short, corners, arc_joins, [-1] * len(code) + list(range(n_cmd))) if with_owner else (short, corners, arc_joins)
     is_g1 = prog.is_g1
+    feed_arr = prog.feed if feeds is None else np.asarray(feeds, dtype=np.float64)
+    owners = [-1] * len(code)
+
+    def own(index):
+        owners.extend([index] * (len(code) - len(owners)))
+
+    def text_of(index):
+        # the command as written, at its override feed if there is one
+        line = prog.text(index).split(";")[0].strip()
+        if feeds is None:
+            return line
+        f = f"F{_fmt(feed_arr[index])}"
+        return _FEED_WORD.sub(f, line) if _FEED_WORD.search(line) else f"{line} {f}"
+
     ex_all = np.zeros(n_cmd)
     for i, v in extra.items():
         ex_all[i] = v
@@ -818,12 +913,13 @@ def vector_angle(params, variables, js, a, b, factor=LAG_LENGTH_REDUCTION_FACTOR
             while end < n_cmd - 1 and is_g1[end + 1] and end not in dwell_at:
                 end += 1
             sl, nx = slice(line_number, end), slice(line_number + 1, end + 1)
-            p = np.column_stack((prog.px[sl], prog.py[sl], prog.x[sl], prog.y[sl], prog.x[nx], prog.y[nx], prog.feed[sl],
-                                 prog.x[nx] - prog.px[nx], prog.y[nx] - prog.py[nx], prog.feed[nx]))
-            out = np.zeros((end - line_number, 10))
+            p = np.column_stack((prog.px[sl], prog.py[sl], prog.x[sl], prog.y[sl], prog.x[nx], prog.y[nx], feed_arr[sl],
+                                 prog.x[nx] - prog.px[nx], prog.y[nx] - prog.py[nx], feed_arr[nx]))
+            out = np.zeros((end - line_number, 11))
             lag_length, lag_previous = _g1_joins(p, ex_all[sl].copy(), fx_all[sl].copy(), st, lag_length, factor, rapid,
                                                  dt_s, js, a, b, eps, 1 if continuous else 0, out, accel, deviation,
-                                                 jerk, min_speed)
+                                                 jerk, min_speed, float(swing_min), float(min_overshoot), bool(steer))
+            g1_feed = out[:, 10] if continuous else p[:, 6]
             arc = out[:, 2] != 0
             keep = np.ones(len(out), dtype=bool)
             if merge and len(out) >= 3:
@@ -835,14 +931,16 @@ def vector_angle(params, variables, js, a, b, factor=LAG_LENGTH_REDUCTION_FACTOR
                 ac = np.hypot(cx_ - ax_, cy_ - ay_)
                 cross = np.abs((cx_ - ax_) * (by_ - ay_) - (cy_ - ay_) * (bx_ - ax_))
                 forward = (bx_ - ax_) * (cx_ - bx_) + (by_ - ay_) * (cy_ - by_) > 0
-                same_feed = (p[:-2, 6] == p[1:-1, 6]) & (p[1:-1, 6] == p[2:, 6])
+                same_feed = (g1_feed[:-2] == g1_feed[1:-1]) & (g1_feed[1:-1] == g1_feed[2:])
                 keep[1:-1] = ~((cross <= 5e-5 * ac) & forward & same_feed & ~arc[:-2] & ~arc[1:-1])
             for k in np.flatnonzero(keep | arc).tolist():
                 if keep[k]:
-                    code.append(f"G1 X{_fmt(out[k, 0])} Y{_fmt(out[k, 1])} F{_fmt(p[k, 6])}")
+                    code.append(f"G1 X{_fmt(out[k, 0])} Y{_fmt(out[k, 1])} F{_fmt(g1_feed[k])}")
                 if arc[k]:
                     code.append(f"G{3 if out[k, 5] else 2} X{_fmt(out[k, 3])} Y{_fmt(out[k, 4])} I{_fmt(out[k, 6])} "
                                 f"J{_fmt(out[k, 7])} F{_fmt(rapid)}")
+                own(line_number + k)
+            own(end - 1)
             for k in np.flatnonzero(out[:, 9]).tolist():
                 corners.append((line_number + k, [p[k, 0], p[k, 1]], [p[k, 2], p[k, 3]], [p[k, 4], p[k, 5]],
                                 float(out[k, 8])))
@@ -854,7 +952,7 @@ def vector_angle(params, variables, js, a, b, factor=LAG_LENGTH_REDUCTION_FACTOR
         # A join into or out of an arc (vector_angle's other branches)
         t1, t2 = prog.tokens(line_number), prog.tokens(line_number + 1)
         command_1_num = float(command_array_1[-1])
-        feed_1 = _feed_of(command_array_1)
+        feed_1 = _feed_of(command_array_1) if feeds is None else float(feed_arr[line_number])
         speed_ratio = feed_1 / js
         command_array_2 = list(t2)
         command_2_num = float(command_array_2[-1])
@@ -874,7 +972,7 @@ def vector_angle(params, variables, js, a, b, factor=LAG_LENGTH_REDUCTION_FACTOR
             arc_joins.append(line_number)
             p1 = point_extraction(t1, 1, lag_length)[0]
             p3 = point_extraction(t2, 3, lag_length)[2]
-            code.append(prog.text(line_number).split(";")[0].strip())
+            code.append(text_of(line_number))
             if abs(angle) == 0:
                 g1_line_length = _dist(p2, p3)
                 p4 = _lerp(lag_length / g1_line_length - 2, p2, p3)
@@ -889,10 +987,13 @@ def vector_angle(params, variables, js, a, b, factor=LAG_LENGTH_REDUCTION_FACTOR
                 i_ = round(p2[0] - p4[0], ROUND_NUM)
                 j_ = round(p2[1] - p4[1], ROUND_NUM)
                 end = f"X{_fmt(round(p3[0], ROUND_NUM))} Y{_fmt(round(p3[1], ROUND_NUM))} I{_fmt(i_)} J{_fmt(j_)}"
+                # (vector_angle wrote the feed on only two of these four: the other two swung
+                # at whatever feed was last set. `fixes` writes the rapid on all of them.)
+                plain = "" if not fixes else f" F{_fmt(rapid)}"
                 if side == 1:
-                    code.append(f"G3 {end} F{_fmt(rapid)}" if command_2_num == 2 else f"G2 {end}")
+                    code.append(f"G3 {end} F{_fmt(rapid)}" if command_2_num == 2 else f"G2 {end}{plain}")
                 else:
-                    code.append(f"G2 {end} F{_fmt(rapid)}" if command_2_num == 2 else f"G3 {end}")
+                    code.append(f"G2 {end} F{_fmt(rapid)}" if command_2_num == 2 else f"G3 {end}{plain}")
             # The arc's centre relative to its new start
             command_array_2[14] = round(float(command_array_2[14]) - p3[0], ROUND_NUM)
             command_array_2[15] = round(float(command_array_2[15]) - p3[1], ROUND_NUM)
@@ -912,7 +1013,7 @@ def vector_angle(params, variables, js, a, b, factor=LAG_LENGTH_REDUCTION_FACTOR
                    f"I{_fmt(command_array_1[14])} J{_fmt(command_array_1[15])} F{_fmt(feed_1)}")
             code.append(arc)
             if g1_2:
-                if abs(angle) != 180:
+                if abs(angle) != 180 and _dist(p3, p2) > 0:
                     p5 = _lerp(lag_length / _dist(p3, p2), p2, p3)
                     side = direction_of_point(*p1, *p2, *p3)
                     i_ = round(p1[0] - p2[0], ROUND_NUM)
@@ -936,6 +1037,7 @@ def vector_angle(params, variables, js, a, b, factor=LAG_LENGTH_REDUCTION_FACTOR
         for line in code[written:]:
             if line.startswith(("G0", "G1", "G2", "G3")):
                 _feed_line(st, line, run, dt_s, js, a, b, eps, no_track)
+        own(line_number)
         written = len(code)
         if not continuous:
             prev_x = float(t2[8] if t2[1] in ("0", "1") else t2[12])
@@ -954,17 +1056,22 @@ def vector_angle(params, variables, js, a, b, factor=LAG_LENGTH_REDUCTION_FACTOR
 
     for seconds in [s for rest in dwell_at.values() for s in rest]:
         code.append(f"G4 P{seconds * 1000:.0f}")
-    code.append(prog.text(n_cmd - 1).split(";")[0].strip())
+    code.append(text_of(n_cmd - 1))
+    own(n_cmd - 1)
     # Delete consecutive duplicate lines (vector_angle dropped the very last line here too,
     # having just appended it; kept here so the path ends where the file does)
-    out = [code[0]]
-    for line in code[1:]:
+    out, out_owner = [code[0]], [owners[0]]
+    for line, owner in zip(code[1:], owners[1:]):
         if line != out[-1]:
             out.append(line)
+            out_owner.append(owner)
+    if with_owner:
+        return out, corners, arc_joins, out_owner
     return out, corners, arc_joins
 
 
 _WORD = re.compile(r"([A-Z])\s*([-+]?(?:\d+\.?\d*|\.\d+))")
+_FEED_WORD = re.compile(r"F\s*[-+]?(?:\d+\.?\d*|\.\d+)")
 
 
 def _feed_line(st, line, run, dt_s, js, a, b, eps, trk):

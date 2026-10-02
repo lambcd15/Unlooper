@@ -695,6 +695,11 @@ def segment_line(params, variables):
                 params["J_increase"] = round(float(params["Command_array"][i+1]) * variables["scale"],2)
             case "Z":
                 params["Z_increase"] = round(float(params["Command_array"][i+1]) * variables["scale"],2)
+            case "A":
+                # Mandrel rotation (degrees): with a mandrel diameter set it is the distance
+                # round the tube's surface, unrolled flat as Y (mandrel.py)
+                if variables.get("Mandrel_diameter_mm", 0) > 0:
+                    params["Y_increase"] = round(float(params["Command_array"][i+1]) * math.pi * variables["Mandrel_diameter_mm"] / 360.0 * variables["scale"], 2)
             case "E":
                 params["E_increase"] = round(float(params["Command_array"][i+1]) * variables["scale"],2)
             case "P":
@@ -711,6 +716,11 @@ def segment_line(params, variables):
             case "M":
                 params["Command_number"] = float(params["Command_array"][i+1])
                 params["Command_flag"] = "M"
+    letters = params["Command_array"][0::2]
+    if (variables.get("Mandrel_diameter_mm", 0) > 0 and "F" in letters and "A" in letters
+            and not any(k in letters for k in ("X", "Y", "Z"))):
+        # A rotation on its own takes F in degrees / min (Mach3): as surface speed
+        params["Feed_rate"] = params["Feed_rate"] * math.pi * variables["Mandrel_diameter_mm"] / 360.0
     return params, variables
 
 
